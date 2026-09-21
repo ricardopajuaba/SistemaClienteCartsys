@@ -1,0 +1,91 @@
+unit View.Principal;
+
+interface
+
+uses
+  System.SysUtils,
+  System.Classes,
+  Vcl.Forms,
+  Vcl.Controls,
+  Vcl.Menus,
+  Vcl.ComCtrls,
+  Vcl.Dialogs,
+  Vcl.Graphics, Vcl.StdCtrls;
+
+type
+  TfrmPrincipal = class(TForm)
+    mnuPrincipal: TMainMenu;
+    miSistema: TMenuItem;
+    miSair: TMenuItem;
+    miCadastros: TMenuItem;
+    miCliente: TMenuItem;
+    miRelatorios: TMenuItem;
+    miRelatorioCliente: TMenuItem;
+    stbRodape: TStatusBar;
+    Ajuda1: TMenuItem;
+    Label1: TLabel;
+    procedure FormCreate(Sender: TObject);
+    procedure miSairClick(Sender: TObject);
+    procedure miClienteClick(Sender: TObject);
+    procedure miRelatorioClienteClick(Sender: TObject);
+  private
+    procedure MostrarCaminhoDoBanco;
+  end;
+
+var
+  frmPrincipal: TfrmPrincipal;
+
+implementation
+
+uses
+  DAO.Conexao,
+  View.ClientePesquisa,
+  View.Relatorio;
+
+{$R *.dfm}
+
+procedure TfrmPrincipal.FormCreate(Sender: TObject);
+begin
+  MostrarCaminhoDoBanco;
+end;
+
+procedure TfrmPrincipal.MostrarCaminhoDoBanco;
+begin
+  try
+    stbRodape.SimpleText := 'Banco: ' + TConexao.Obter.CaminhoBanco;
+  except
+    on E: Exception do
+      stbRodape.SimpleText := 'Banco indisponivel: ' + E.Message;
+  end;
+end;
+
+procedure TfrmPrincipal.miSairClick(Sender: TObject);
+begin
+  Close;
+end;
+
+procedure TfrmPrincipal.miClienteClick(Sender: TObject);
+var
+  LForm: TfrmClientePesquisa;
+begin
+  LForm := TfrmClientePesquisa.Create(Self);
+  try
+    LForm.ShowModal;
+  finally
+    LForm.Free;
+  end;
+end;
+
+procedure TfrmPrincipal.miRelatorioClienteClick(Sender: TObject);
+var
+  LForm: TfrmRelatorio;
+begin
+  LForm := TfrmRelatorio.Create(Self);
+  try
+    LForm.ShowModal;
+  finally
+    LForm.Free;
+  end;
+end;
+
+end.

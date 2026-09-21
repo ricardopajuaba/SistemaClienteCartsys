@@ -1,0 +1,401 @@
+unit DAO.Conexao;
+
+{ ============================================================================
+  Conexao unica com o Firebird, via FireDAC.
+
+  POR QUE SINGLETON?
+  Uma aplicacao desktop deste porte nao ganha nada abrindo varias conexoes -
+  ganha problemas: transacoes soltas, lock e consumo de handle a toa. Entao
+  existe UMA conexao, criada na primeira vez que alguem pede e liberada no
+  fim do programa.
+
+  POR QUE FIREBIRD EMBEDDED?
+  Nao exige instalar servidor nem servico do Windows na maquina do usuario.
+  Basta a pasta 'firebird' ao lado do .exe. Isso faz a aplicacao rodar em
+  qualquer micro so copiando a pasta - inclusive na maquina do avaliador.
+  A chave disso e o VendorLib, que aponta a fbclient.dll local.
+
+  ATENCAO - UNIT DE ESPERA (wait cursor)
+  O FireDAC exige que a aplicacao registre um "wait cursor", senao o primeiro
+  Open levanta "Object factory for class ... missing". Esta unit NAO faz isso
+  de proposito: camada de dados nao deve depender de UI. Quem declara e o .dpr:
+      aplicacao VCL .... uses FireDAC.VCLUI.Wait
+      aplicacao console  uses FireDAC.ConsoleUI.Wait
+
+  TRANSACAO
+  A transacao e explicita (TFDTransaction) e NAO fica em autocommit. Quem
+  grava chama Iniciar / Confirmar / Desfazer. Assim uma operacao que mexe em
+  mais de uma tabela ou falha no meio nao deixa dado pela metade.
+  ============================================================================ }
+
+interface
+
+uses
+  System.SysUtils,
+  System.Classes,
+  System.IniFiles,
+  System.IOUtils,
+  FireDAC.Stan.Intf,
+  FireDAC.Stan.Option,
+  FireDAC.Stan.Error,
+  FireDAC.Stan.Def,
+  FireDAC.Stan.Pool,
+  FireDAC.Stan.Async,
+  FireDAC.Phys,
+  FireDAC.Phys.Intf,
+  FireDAC.Phys.FB,
+  FireDAC.Phys.FBDef,
+  FireDAC.UI.Intf,
+  FireDAC.DApt,
+  FireDAC.Comp.Client;
+
+type
+  EConexaoBanco = class(Exception);
+
+  TConexao = class
+  private
+    FConnection: TFDConnection;
+    FTransacao: TFDTransaction;
+    FDriverLink: TFDPhysFBDriverLink;
+    FCaminhoBanco: string;
+    FCaminhoClientDLL: string;
+
+    { True enquanto uma operacao de GRAVACAO estiver em andamento, ou seja,
+      entre IniciarTransacao e Confirmar/Desfazer. Serve para EncerrarLeitura
+      saber que nao pode fechar a transacao no meio de uma gravacao. }
+    FGravacaoEmAndamento: Boolean;
+
+    procedure CarregarConfiguracao;
+    procedure ConfigurarDriver;
+    procedure ConfigurarConexao;
+    constructor CriarInterno;
+  public
+    destructor Destroy; override;
+
+    { Instancia unica. O primeiro acesso ja abre a conexao. }
+    class function Obter: TConexao;
+    class procedure Liberar;
+
+    procedure Conectar;
+    procedure Desconectar;
+    function Conectado: Boolean;
+
+    { Controle explicito de transacao }
+    procedure IniciarTransacao;
+    procedure Confirmar;
+    procedure Desfazer;
+    function EmTransacao: Boolean;
+
+    { Fecha a transacao aberta por uma CONSULTA.
+
+      Como AutoStart esta desligado, ate um SELECT precisa de transacao, e quem
+      a abre e o NovaQuery. Se ninguem fechasse, ela ficaria aberta a sessao
+      inteira - e no Firebird uma transacao velha e viva segura o garbage
+      collector e faz o banco crescer a toa.
+
+      Chame no fim de cada consulta. Se houver gravacao em andamento, o metodo
+      nao faz nada: quem manda naquele caso e o Confirmar/Desfazer. }
+    procedure EncerrarLeitura;
+
+    { Cria um TFDQuery ja ligado nesta conexao e nesta transacao }
+    function NovaQuery: TFDQuery;
+
+    property Connection: TFDConnection read FConnection;
+    property CaminhoBanco: string read FCaminhoBanco;
+  end;
+
+implementation
+
+var
+  FInstancia: TConexao = nil;
+
+{ ---------------------------------------------------------------------------
+  Singleton
+  --------------------------------------------------------------------------- }
+
+class function TConexao.Obter: TConexao;
+begin
+  if FInstancia = nil then
+  begin
+    FInstancia := TConexao.CriarInterno;
+    FInstancia.Conectar;
+  end;
+  Result := FInstancia;
+end;
+
+class procedure TConexao.Liberar;
+begin
+  FreeAndNil(FInstancia);
+end;
+
+constructor TConexao.CriarInterno;
+begin
+  inherited Create;
+
+  FGravacaoEmAndamento := False;
+
+  FDriverLink := TFDPhysFBDriverLink.Create(nil);
+
+  FConnection := TFDConnection.Create(nil);
+  FTransacao  := TFDTransaction.Create(nil);
+
+  CarregarConfiguracao;
+  ConfigurarDriver;
+  ConfigurarConexao;
+end;
+
+destructor TConexao.Destroy;
+begin
+  if Assigned(FConnection) and FConnection.Connected then
+  begin
+    if FTransacao.Active then
+      FTransacao.Rollback;
+    FConnection.Connected := False;
+  end;
+
+  FreeAndNil(FTransacao);
+  FreeAndNil(FConnection);
+  FreeAndNil(FDriverLink);
+
+  inherited Destroy;
+end;
+
+{ ---------------------------------------------------------------------------
+  Configuracao
+
+  Le de ControleClientes.ini, ao lado do .exe. Se o arquivo nao existir, assume
+  o layout padrao de distribuicao:
+      <pasta do exe>\banco\CONTROLECLIENTES.FDB
+      <pasta do exe>\firebird\fbclient.dll
+  --------------------------------------------------------------------------- }
+
+procedure TConexao.CarregarConfiguracao;
+var
+  LIni: TIniFile;
+  LPastaApp: string;
+  LArquivoIni: string;
+begin
+  LPastaApp := IncludeTrailingPathDelimiter(ExtractFilePath(ParamStr(0)));
+  LArquivoIni := LPastaApp + 'ControleClientes.ini';
+
+  FCaminhoBanco     := LPastaApp + 'banco\CONTROLECLIENTES.FDB';
+  FCaminhoClientDLL := LPastaApp + 'firebird\fbclient.dll';
+
+  if FileExists(LArquivoIni) then
+  begin
+    LIni := TIniFile.Create(LArquivoIni);
+    try
+      FCaminhoBanco     := LIni.ReadString('BANCO', 'Database', FCaminhoBanco);
+      FCaminhoClientDLL := LIni.ReadString('BANCO', 'VendorLib', FCaminhoClientDLL);
+
+      { O .ini aceita caminho relativo por comodidade, mas o Firebird precisa
+        de caminho absoluto - senao ele resolve contra o diretorio corrente,
+        que muda conforme de onde a aplicacao foi chamada. }
+      if TPath.IsRelativePath(FCaminhoBanco) then
+        FCaminhoBanco := LPastaApp + FCaminhoBanco;
+      if TPath.IsRelativePath(FCaminhoClientDLL) then
+        FCaminhoClientDLL := LPastaApp + FCaminhoClientDLL;
+    finally
+      LIni.Free;
+    end;
+  end;
+end;
+
+procedure TConexao.ConfigurarDriver;
+begin
+  FDriverLink.DriverID := 'FB';
+
+  { Aponta a fbclient.dll que veio junto da aplicacao. Sem isso o FireDAC sai
+    procurando uma instalacao de Firebird no sistema - que pode nao existir,
+    ou pior, existir numa versao diferente. }
+  if FileExists(FCaminhoClientDLL) then
+    FDriverLink.VendorLib := FCaminhoClientDLL;
+end;
+
+procedure TConexao.ConfigurarConexao;
+begin
+  FTransacao.Connection := FConnection;
+
+  { ReadCommitted: leituras nao travam uma na outra. }
+  FTransacao.Options.Isolation := xiReadCommitted;
+  FTransacao.Options.ReadOnly  := False;
+
+  { ------------------------------------------------------------------------
+    ATENCAO - ESTES TRES FLAGS SAO O CORACAO DO CONTROLE DE TRANSACAO.
+
+    Configurar AutoCommit so na CONEXAO nao adianta nada quando existe um
+    TFDTransaction ligado a ela: quem vale sao as Options DELE. E os padroes
+    do FireDAC trabalham contra o controle explicito:
+
+      AutoCommit = True  -> confirma sozinho depois de cada comando
+      AutoStop   = True  -> confirma sozinho quando o ultimo dataset fecha
+
+    Com os padroes, um INSERT seguido de Rollback NAO desfaz coisa alguma: o
+    FireDAC ja tinha commitado por conta propria quando a query fechou. Foi
+    exatamente esse o bug que o teste automatizado pegou.
+
+    AutoStart tambem fica False. Com ele ligado, a PRIMEIRA leitura ja abria
+    uma transacao implicita por conta propria; quando o codigo depois chamava
+    IniciarTransacao, encontrava Active=True e nao fazia nada - e a gravacao
+    acabava dentro daquela transacao implicita, que o FireDAC fechava sozinho.
+    O rollback entao nao desfazia o INSERT. Com os tres flags em False, nada
+    acontece sem a aplicacao mandar.
+
+    Como AutoStart esta desligado, quem abre a transacao das LEITURAS e o
+    proprio NovaQuery - ver la embaixo.
+    ------------------------------------------------------------------------ }
+  FTransacao.Options.AutoCommit := False;
+  FTransacao.Options.AutoStop   := False;
+  FTransacao.Options.AutoStart  := False;
+
+  { ------------------------------------------------------------------------
+    NO AUTO UNDO - nao remova esta linha sem ler o que vem abaixo.
+
+    Por padrao o Firebird usa "auto undo": no ROLLBACK ele desfaz as alteracoes
+    uma a uma, usando um savepoint de nivel de transacao, e em seguida marca a
+    transacao como COMMITADA (isso reduz lixo para o garbage collector).
+
+    Esse atalho tem um efeito colateral desagradavel: se a MESMA linha for
+    inserida e depois excluida dentro da mesma transacao, o undo do DELETE
+    restaura a versao criada pelo INSERT - e, como a transacao acaba
+    commitada, a linha que deveria ter sumido fica visivel no banco.
+
+    Isso NAO e defeito do FireDAC nem deste codigo: reproduz igualzinho no
+    isql, em SQL puro. Verificado no Firebird 3.0.10:
+
+        18 registros -> INSERT -> 19 -> DELETE -> 18 -> ROLLBACK -> 19  (!)
+
+    Com no_auto_undo o ROLLBACK passa a ser um rollback de verdade e o mesmo
+    roteiro termina com 18, como se espera.
+    ------------------------------------------------------------------------ }
+  FTransacao.Options.Params.Clear;
+  FTransacao.Options.Params.Add('no_auto_undo');
+
+  FConnection.Transaction       := FTransacao;
+  FConnection.UpdateTransaction := FTransacao;
+
+  FConnection.LoginPrompt := False;
+
+  FConnection.Params.Clear;
+  FConnection.Params.DriverID  := 'FB';
+  FConnection.Params.Database  := FCaminhoBanco;
+  FConnection.Params.UserName  := 'SYSDBA';
+  FConnection.Params.Password  := 'masterkey';
+  FConnection.Params.Add('CharacterSet=UTF8');
+
+  { NAO declarar Protocol aqui.
+    Em FireDAC, Protocol=Local significa XNET, que e comunicacao com um
+    SERVIDOR Firebird local rodando como servico. Como aqui usamos o modo
+    EMBEDDED, o caminho do arquivo sozinho basta: a propria fbclient.dll
+    carrega o motor (plugins\engine12.dll) dentro do processo. Declarar
+    Protocol faz a conexao falhar com 'Unable to complete network request'. }
+end;
+
+{ ---------------------------------------------------------------------------
+  Conexao
+  --------------------------------------------------------------------------- }
+
+procedure TConexao.Conectar;
+begin
+  if FConnection.Connected then
+    Exit;
+
+  if not FileExists(FCaminhoBanco) then
+    raise EConexaoBanco.CreateFmt(
+      'Banco de dados nao encontrado em:' + sLineBreak + '%s' + sLineBreak + sLineBreak +
+      'Confira o caminho no arquivo ControleClientes.ini.', [FCaminhoBanco]);
+
+  try
+    FConnection.Connected := True;
+  except
+    on E: Exception do
+      raise EConexaoBanco.CreateFmt(
+        'Nao foi possivel conectar ao banco de dados.' + sLineBreak + sLineBreak +
+        'Banco : %s' + sLineBreak +
+        'Client: %s' + sLineBreak + sLineBreak +
+        'Erro  : %s', [FCaminhoBanco, FCaminhoClientDLL, E.Message]);
+  end;
+end;
+
+procedure TConexao.Desconectar;
+begin
+  if FTransacao.Active then
+    FTransacao.Rollback;
+  FConnection.Connected := False;
+end;
+
+function TConexao.Conectado: Boolean;
+begin
+  Result := Assigned(FConnection) and FConnection.Connected;
+end;
+
+{ ---------------------------------------------------------------------------
+  Transacao
+  --------------------------------------------------------------------------- }
+
+procedure TConexao.IniciarTransacao;
+begin
+  Conectar;
+
+  { Uma consulta anterior pode ter deixado transacao aberta. Ela e encerrada
+    aqui para a gravacao comecar num escopo limpo, com inicio bem definido. }
+  if FTransacao.Active and not FGravacaoEmAndamento then
+    FTransacao.Commit;
+
+  if not FTransacao.Active then
+    FTransacao.StartTransaction;
+
+  FGravacaoEmAndamento := True;
+end;
+
+procedure TConexao.Confirmar;
+begin
+  if FTransacao.Active then
+    FTransacao.Commit;
+  FGravacaoEmAndamento := False;
+end;
+
+procedure TConexao.Desfazer;
+begin
+  if FTransacao.Active then
+    FTransacao.Rollback;
+  FGravacaoEmAndamento := False;
+end;
+
+procedure TConexao.EncerrarLeitura;
+begin
+  if FGravacaoEmAndamento then
+    Exit;
+
+  if Assigned(FTransacao) and FTransacao.Active then
+    FTransacao.Commit;
+end;
+
+function TConexao.EmTransacao: Boolean;
+begin
+  Result := Assigned(FTransacao) and FTransacao.Active;
+end;
+
+function TConexao.NovaQuery: TFDQuery;
+begin
+  Conectar;
+
+  { Com AutoStart desligado, o FireDAC exige transacao ativa ate para ler.
+    Abrimos aqui, de forma explicita. Se a aplicacao ja tinha aberto uma para
+    gravar, esta continua valendo - e a leitura enxerga o que foi gravado e
+    ainda nao confirmado, que e o comportamento desejado dentro de uma
+    operacao de negocio. }
+  if not FTransacao.Active then
+    FTransacao.StartTransaction;
+
+  Result := TFDQuery.Create(nil);
+  Result.Connection := FConnection;
+  Result.Transaction := FTransacao;
+end;
+
+initialization
+
+finalization
+  TConexao.Liberar;
+
+end.

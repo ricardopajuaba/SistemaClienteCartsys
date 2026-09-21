@@ -1,0 +1,249 @@
+unit Service.ViaCep;
+
+{ ============================================================================
+  Consulta de CEP na API publica ViaCEP (https://viacep.com.br).
+
+  COMO A API RESPONDE
+
+  Sucesso - devolve um objeto JSON com os campos:
+      cep, logradouro, complemento, bairro, localidade, uf
+      ex.: logradouro = "Avenida Paulista", localidade = "Sao Paulo", uf = "SP"
+
+  CEP com formato certo mas inexistente:
+      devolve um objeto com o campo  erro = true
+      (ja veio como booleano e como a string "true" ao longo do tempo, por
+       isso a checagem aqui aceita as duas formas)
+
+  CEP malformado:
+      devolve HTTP 400
+
+  Os tres casos sao tratados e devolvidos de forma uniforme para a tela.
+
+  NOTA PARA QUEM FOR MEXER AQUI
+  Nao cole exemplo de JSON dentro de um comentario de chaves: a chave de
+  fechamento do JSON encerra o comentario e o Delphi passa a ler o texto como
+  codigo. Use (* *) ou descreva os campos, como esta feito acima.
+
+  POR QUE THTTPClient E NAO OS COMPONENTES REST?
+  Porque assim esta unit nao depende de nada de design-time: da para chamar de
+  qualquer lugar, inclusive de um teste de console, sem arrastar componente
+  para formulario nenhum.
+  ============================================================================ }
+
+interface
+
+uses
+  System.SysUtils,
+  System.Classes,
+  System.JSON,
+  System.Net.HttpClient,
+  System.Net.URLClient,
+  System.NetEncoding;
+
+type
+  { Resultado da consulta. Usar record evita ter que lembrar de dar Free. }
+  TEnderecoCep = record
+    Cep: string;
+    Logradouro: string;
+    Complemento: string;
+    Bairro: string;
+    Cidade: string;
+    Uf: string;
+    Encontrado: Boolean;
+    Erro: string;
+
+    procedure Limpar;
+  end;
+
+  TViaCepService = class
+  private
+    const
+      URL_BASE = 'https://viacep.com.br/ws/%s/json/';
+      TIMEOUT_MS = 8000;
+  public
+    { Deixa so os digitos do CEP }
+    class function SomenteDigitos(const ACep: string): string;
+
+    { Verifica apenas o formato (8 digitos), sem ir na internet }
+    class function FormatoValido(const ACep: string): Boolean;
+
+    { "01310200" -> "01310-200" }
+    class function Formatar(const ACep: string): string;
+
+    { Consulta a API.
+      Retorna True quando o endereco foi encontrado. Em qualquer outro caso
+      retorna False e o motivo vem preenchido em Result.Erro, pronto para ser
+      mostrado ao usuario. Esta funcao NAO levanta excecao por falha de rede. }
+    class function Consultar(const ACep: string): TEnderecoCep;
+  end;
+
+implementation
+
+{ ---------------------------------------------------------------------------
+  TEnderecoCep
+  --------------------------------------------------------------------------- }
+
+procedure TEnderecoCep.Limpar;
+begin
+  Cep         := '';
+  Logradouro  := '';
+  Complemento := '';
+  Bairro      := '';
+  Cidade      := '';
+  Uf          := '';
+  Encontrado  := False;
+  Erro        := '';
+end;
+
+{ ---------------------------------------------------------------------------
+  TViaCepService
+  --------------------------------------------------------------------------- }
+
+class function TViaCepService.SomenteDigitos(const ACep: string): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 1 to Length(ACep) do
+    if CharInSet(ACep[I], ['0'..'9']) then
+      Result := Result + ACep[I];
+end;
+
+class function TViaCepService.FormatoValido(const ACep: string): Boolean;
+begin
+  Result := Length(SomenteDigitos(ACep)) = 8;
+end;
+
+class function TViaCepService.Formatar(const ACep: string): string;
+var
+  LDigitos: string;
+begin
+  LDigitos := SomenteDigitos(ACep);
+  if Length(LDigitos) = 8 then
+    Result := Copy(LDigitos, 1, 5) + '-' + Copy(LDigitos, 6, 3)
+  else
+    Result := ACep;
+end;
+
+class function TViaCepService.Consultar(const ACep: string): TEnderecoCep;
+var
+  LHttp: THTTPClient;
+  LResposta: IHTTPResponse;
+  LCepLimpo: string;
+  LConteudo: string;
+  LJson: TJSONValue;
+  LObjeto: TJSONObject;
+  LValorErro: TJSONValue;
+
+  { A API as vezes devolve o campo ausente; neste caso queremos string vazia
+    em vez de erro de acesso a nil. }
+  function Texto(const ACampo: string): string;
+  var
+    LValor: TJSONValue;
+  begin
+    Result := '';
+    LValor := LObjeto.GetValue(ACampo);
+    if Assigned(LValor) then
+      Result := LValor.Value;
+  end;
+
+begin
+  Result.Limpar;
+
+  LCepLimpo := SomenteDigitos(ACep);
+
+  { Antes de gastar uma ida na internet, confere o formato }
+  if LCepLimpo = '' then
+  begin
+    Result.Erro := 'Informe o CEP.';
+    Exit;
+  end;
+
+  if Length(LCepLimpo) <> 8 then
+  begin
+    Result.Erro := Format(
+      'CEP invalido: deve conter 8 digitos, foram informados %d.',
+      [Length(LCepLimpo)]);
+    Exit;
+  end;
+
+  LHttp := THTTPClient.Create;
+  try
+    LHttp.ConnectionTimeout := TIMEOUT_MS;
+    LHttp.ResponseTimeout   := TIMEOUT_MS;
+
+    try
+      LResposta := LHttp.Get(Format(URL_BASE, [LCepLimpo]));
+    except
+      on E: Exception do
+      begin
+        { Sem internet, DNS fora do ar, proxy bloqueando... O cadastro nao pode
+          parar por isso: avisamos e deixamos o usuario digitar na mao. }
+        Result.Erro :=
+          'Nao foi possivel consultar o CEP agora (' + E.Message + ').' +
+          sLineBreak + 'Preencha o endereco manualmente.';
+        Exit;
+      end;
+    end;
+
+    if LResposta.StatusCode = 400 then
+    begin
+      Result.Erro := 'CEP invalido: a consulta foi recusada pelo ViaCEP.';
+      Exit;
+    end;
+
+    if LResposta.StatusCode <> 200 then
+    begin
+      Result.Erro := Format(
+        'O servico de CEP respondeu com o codigo %d. Tente novamente.',
+        [LResposta.StatusCode]);
+      Exit;
+    end;
+
+    LConteudo := LResposta.ContentAsString(TEncoding.UTF8);
+
+    LJson := TJSONObject.ParseJSONValue(LConteudo);
+    if not Assigned(LJson) then
+    begin
+      Result.Erro := 'Resposta do servico de CEP em formato inesperado.';
+      Exit;
+    end;
+
+    try
+      if not (LJson is TJSONObject) then
+      begin
+        Result.Erro := 'Resposta do servico de CEP em formato inesperado.';
+        Exit;
+      end;
+
+      LObjeto := TJSONObject(LJson);
+
+      { CEP bem formado porem inexistente. O ViaCEP ja devolveu esse campo
+        como booleano e como string "true" ao longo do tempo - por isso a
+        checagem aqui aceita as duas formas. }
+      LValorErro := LObjeto.GetValue('erro');
+      if Assigned(LValorErro) then
+      begin
+        if SameText(LValorErro.Value, 'true') then
+        begin
+          Result.Erro := 'CEP nao encontrado.';
+          Exit;
+        end;
+      end;
+
+      Result.Cep         := Formatar(Texto('cep'));
+      Result.Logradouro  := Texto('logradouro');
+      Result.Complemento := Texto('complemento');
+      Result.Bairro      := Texto('bairro');
+      Result.Cidade      := Texto('localidade');
+      Result.Uf          := Texto('uf');
+      Result.Encontrado  := True;
+    finally
+      LJson.Free;
+    end;
+  finally
+    LHttp.Free;
+  end;
+end;
+
+end.

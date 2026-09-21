@@ -1,0 +1,497 @@
+unit View.Cliente;
+
+{ ============================================================================
+  Tela de cadastro de cliente (inclusao e alteracao).
+
+  O QUE ESTA TELA *NAO* FAZ
+  Ela nao valida CPF, nao decide se o CEP existe, nao monta SQL e nao abre
+  transacao. Tudo isso mora nas camadas de baixo e ja esta coberto pelos
+  testes automatizados. Aqui so acontecem tres coisas:
+
+      1. copiar o que esta na tela para a entidade   (TelaParaEntidade)
+      2. pedir ao Controller que salve                (FController.Salvar)
+      3. mostrar a mensagem, se ele reclamar          (ERegraNegocio)
+
+  Esse e o ponto pratico da arquitetura em camadas: a tela fica pequena.
+
+  POR QUE DUAS ROTINAS DE COPIA EM VEZ DE DATA-AWARE CONTROLS?
+  Com componentes ligados a DataSet (TcxDBTextEdit e afins) o cadastro sairia
+  quase de graca - e o formulario passaria a depender do FireDAC, o que
+  derrubaria a separacao de camadas descrita no README. As duas rotinas de
+  copia sao o preco, pequeno e explicito, de manter a tela ignorante quanto a
+  origem do dado.
+
+  O CEP E O ViaCEP
+  Ao sair do campo CEP a tela chama o Controller, que consulta a API publica e
+  ja devolve o ID da cidade resolvido contra o nosso cadastro. A tela nao sabe
+  o que e HTTP nem o que e JSON.
+
+  Detalhe importante: a consulta so acontece quando o CEP realmente MUDOU. Sem
+  essa checagem, cada passada de foco pelo campo dispararia uma ida a internet
+  - inclusive quando o usuario so esta navegando com Tab sem alterar nada.
+  ============================================================================ }
+
+interface
+
+uses
+  System.SysUtils,
+  System.Classes,
+  System.Variants,
+  System.Generics.Collections,
+  Vcl.Forms,
+  Vcl.Controls,
+  Vcl.Graphics,
+  Vcl.Dialogs,
+  Vcl.ExtCtrls,
+  Vcl.StdCtrls,
+  cxGraphics,
+  cxControls,
+  cxLookAndFeels,
+  cxLookAndFeelPainters,
+  cxStyles,
+  cxEdit,
+  cxContainer,
+  cxTextEdit,
+  cxMaskEdit,
+  cxDropDownEdit,
+  cxCalendar,
+  cxLabel,
+  cxButtons,
+  Model.Entity.Cliente,
+  Model.Entity.Cidade,
+  Model.Entity.Estado,
+  Controller.Cliente;
+
+type
+  TfrmCliente = class(TForm)
+    pnlCampos: TPanel;
+    lblId: TcxLabel;
+    edtId: TcxTextEdit;
+    lblNome: TcxLabel;
+    edtNome: TcxTextEdit;
+    lblCpfCnpj: TcxLabel;
+    edtCpfCnpj: TcxTextEdit;
+    lblNascimento: TcxLabel;
+    edtNascimento: TcxDateEdit;
+    lblCep: TcxLabel;
+    edtCep: TcxMaskEdit;
+    lblDicaCep: TcxLabel;
+    lblEndereco: TcxLabel;
+    edtEndereco: TcxTextEdit;
+    lblNumero: TcxLabel;
+    edtNumero: TcxTextEdit;
+    lblComplemento: TcxLabel;
+    edtComplemento: TcxTextEdit;
+    lblBairro: TcxLabel;
+    edtBairro: TcxTextEdit;
+    lblEstado: TcxLabel;
+    cbEstado: TcxComboBox;
+    lblCidade: TcxLabel;
+    cbCidade: TcxComboBox;
+    pnlAcoes: TPanel;
+    btnSalvar: TcxButton;
+    btnCancelar: TcxButton;
+    procedure FormCreate(Sender: TObject);
+    procedure FormDestroy(Sender: TObject);
+    procedure edtCepPropertiesChange(Sender: TObject);
+    procedure edtCepExit(Sender: TObject);
+    procedure edtCpfCnpjExit(Sender: TObject);
+    procedure cbEstadoPropertiesChange(Sender: TObject);
+    procedure btnSalvarClick(Sender: TObject);
+    procedure btnCancelarClick(Sender: TObject);
+  private
+    FController: TClienteController;
+    FCliente: TCliente;
+
+    { Carregados uma vez na abertura da tela. Todo estado e toda cidade do
+      cadastro cabem com folga na memoria (4 e 20 registros), entao trocar de
+      estado filtra a lista que ja esta aqui em vez de ir ao banco de novo. }
+    FEstados: TObjectList<TEstado>;
+    FCidades: TObjectList<TCidade>;
+
+    { Ultimo CEP efetivamente consultado na API, so com digitos. Evita
+      reconsultar a cada saida de foco. }
+    FCepConsultado: string;
+
+    procedure CarregarCombos;
+    procedure FiltrarCidadesPorEstado(AEstadoId: Integer);
+
+    function EstadoSelecionado: Integer;
+    function CidadeSelecionada: Integer;
+    procedure SelecionarCidade(ACidadeId: Integer);
+
+    procedure EntidadeParaTela;
+    procedure TelaParaEntidade;
+
+    function CepDigitado: string;
+    procedure ConsultarCep;
+  public
+    { Chamar ANTES do ShowModal.
+      AId = 0 abre em modo de inclusao; qualquer outro valor le o cliente do
+      banco e abre em modo de alteracao. }
+    procedure Carregar(AId: Integer);
+  end;
+
+implementation
+
+uses
+  Service.EnterTab,
+  Service.Documento,
+  Service.ViaCep;
+
+{$R *.dfm}
+
+{ ---------------------------------------------------------------------------
+  Ciclo de vida
+  --------------------------------------------------------------------------- }
+
+procedure TfrmCliente.FormCreate(Sender: TObject);
+begin
+  FController := TClienteController.Create;
+  FCliente := TCliente.Create;
+  FCepConsultado := '';
+
+  CarregarCombos;
+
+  { Exigencia do teste: Enter funcionando como Tab - ver Service.EnterTab. }
+  TEnterComoTab.Instalar(Self);
+end;
+
+procedure TfrmCliente.FormDestroy(Sender: TObject);
+begin
+  { Ordem importa: os combos apontam para objetos DESTAS listas. Como o
+    formulario so destroi seus componentes depois do OnDestroy, limpamos os
+    combos antes de soltar as listas para nao deixar referencia pendurada. }
+  cbCidade.Properties.Items.Clear;
+  cbEstado.Properties.Items.Clear;
+
+  FreeAndNil(FCidades);
+  FreeAndNil(FEstados);
+  FreeAndNil(FCliente);
+  FreeAndNil(FController);
+end;
+
+{ ---------------------------------------------------------------------------
+  Combos de estado e cidade
+
+  O ID de cada item vai no Objects do TStrings, guardando a propria entidade.
+  E o idioma classico do Delphi para combo com codigo: o texto e o que o
+  usuario le, o Objects e o que o programa usa. Guardar a ENTIDADE em vez de
+  um Integer convertido em ponteiro evita cast e ainda da acesso a UF e ao
+  EstadoId na hora de filtrar.
+
+  As entidades pertencem a FEstados / FCidades - o combo so referencia.
+  --------------------------------------------------------------------------- }
+
+procedure TfrmCliente.CarregarCombos;
+var
+  I: Integer;
+begin
+  FEstados := FController.ListarEstados;
+  FCidades := FController.ListarCidades;
+
+  cbEstado.Properties.Items.Clear;
+  cbEstado.Properties.Items.AddObject('(todos os estados)', nil);
+  for I := 0 to FEstados.Count - 1 do
+    cbEstado.Properties.Items.AddObject(FEstados[I].Descricao, FEstados[I]);
+  cbEstado.ItemIndex := 0;
+
+  FiltrarCidadesPorEstado(0);
+end;
+
+procedure TfrmCliente.FiltrarCidadesPorEstado(AEstadoId: Integer);
+var
+  I: Integer;
+  LCidade: TCidade;
+begin
+  cbCidade.Properties.Items.BeginUpdate;
+  try
+    cbCidade.Properties.Items.Clear;
+    cbCidade.Properties.Items.AddObject('(selecione a cidade)', nil);
+
+    for I := 0 to FCidades.Count - 1 do
+    begin
+      LCidade := FCidades[I];
+      if (AEstadoId = 0) or (LCidade.EstadoId = AEstadoId) then
+        cbCidade.Properties.Items.AddObject(LCidade.Descricao, LCidade);
+    end;
+  finally
+    cbCidade.Properties.Items.EndUpdate;
+  end;
+
+  cbCidade.ItemIndex := 0;
+end;
+
+function TfrmCliente.EstadoSelecionado: Integer;
+var
+  LObjeto: TObject;
+begin
+  Result := 0;
+  if cbEstado.ItemIndex < 0 then
+    Exit;
+
+  LObjeto := cbEstado.Properties.Items.Objects[cbEstado.ItemIndex];
+  if LObjeto is TEstado then
+    Result := TEstado(LObjeto).Id;
+end;
+
+function TfrmCliente.CidadeSelecionada: Integer;
+var
+  LObjeto: TObject;
+begin
+  Result := 0;
+  if cbCidade.ItemIndex < 0 then
+    Exit;
+
+  LObjeto := cbCidade.Properties.Items.Objects[cbCidade.ItemIndex];
+  if LObjeto is TCidade then
+    Result := TCidade(LObjeto).Id;
+end;
+
+{ Seleciona a cidade pelo ID, ajustando antes o combo de estado para que a
+  cidade procurada esteja presente na lista filtrada. }
+procedure TfrmCliente.SelecionarCidade(ACidadeId: Integer);
+var
+  I: Integer;
+  LCidade: TCidade;
+  LObjeto: TObject;
+begin
+  if ACidadeId <= 0 then
+  begin
+    cbCidade.ItemIndex := 0;
+    Exit;
+  end;
+
+  LCidade := nil;
+  for I := 0 to FCidades.Count - 1 do
+    if FCidades[I].Id = ACidadeId then
+    begin
+      LCidade := FCidades[I];
+      Break;
+    end;
+
+  if LCidade = nil then
+  begin
+    { Cidade que nao esta no cadastro: nao ha o que selecionar. Nao e erro -
+      o Controller ja avisou o usuario quando isso veio do ViaCEP. }
+    cbCidade.ItemIndex := 0;
+    Exit;
+  end;
+
+  { Posiciona o estado. Isso dispara cbEstadoPropertiesChange, que refaz a
+    lista de cidades filtrada por aquele estado. }
+  for I := 0 to cbEstado.Properties.Items.Count - 1 do
+  begin
+    LObjeto := cbEstado.Properties.Items.Objects[I];
+    if (LObjeto is TEstado) and (TEstado(LObjeto).Id = LCidade.EstadoId) then
+    begin
+      cbEstado.ItemIndex := I;
+      Break;
+    end;
+  end;
+
+  FiltrarCidadesPorEstado(LCidade.EstadoId);
+
+  for I := 0 to cbCidade.Properties.Items.Count - 1 do
+  begin
+    LObjeto := cbCidade.Properties.Items.Objects[I];
+    if (LObjeto is TCidade) and (TCidade(LObjeto).Id = ACidadeId) then
+    begin
+      cbCidade.ItemIndex := I;
+      Exit;
+    end;
+  end;
+end;
+
+procedure TfrmCliente.cbEstadoPropertiesChange(Sender: TObject);
+begin
+  FiltrarCidadesPorEstado(EstadoSelecionado);
+end;
+
+{ ---------------------------------------------------------------------------
+  Carga da tela
+  --------------------------------------------------------------------------- }
+
+procedure TfrmCliente.Carregar(AId: Integer);
+var
+  LCarregado: TCliente;
+begin
+  if AId > 0 then
+  begin
+    LCarregado := FController.ObterPorId(AId);
+    if LCarregado = nil then
+      raise Exception.CreateFmt('Cliente %d nao encontrado.', [AId]);
+    try
+      { Copia para a entidade da tela e descarta a que veio do banco. Assim o
+        formulario tem um unico dono de memoria: FCliente. }
+      FCliente.Assign(LCarregado);
+    finally
+      LCarregado.Free;
+    end;
+
+    Caption := Format('Cliente - alteracao (ID %d)', [AId]);
+    FCepConsultado := TViaCepService.SomenteDigitos(FCliente.Cep);
+  end
+  else
+  begin
+    Caption := 'Cliente - inclusao';
+    FCepConsultado := '';
+  end;
+
+  EntidadeParaTela;
+end;
+
+procedure TfrmCliente.EntidadeParaTela;
+begin
+  if FCliente.EhNovo then
+    edtId.Text := '(novo)'
+  else
+    edtId.Text := IntToStr(FCliente.Id);
+
+  edtNome.Text        := FCliente.Nome;
+  edtCpfCnpj.Text     := TDocumento.Formatar(FCliente.CpfCnpj);
+  edtCep.Text         := TViaCepService.Formatar(FCliente.Cep);
+  edtEndereco.Text    := FCliente.Endereco;
+  edtNumero.Text      := FCliente.Numero;
+  edtComplemento.Text := FCliente.Complemento;
+  edtBairro.Text      := FCliente.Bairro;
+
+  { Data nula na entidade e 0. No TcxDateEdit, Null deixa o campo em branco;
+    0 mostraria 30/12/1899. }
+  if FCliente.DataNascimento > 0 then
+    edtNascimento.Date := FCliente.DataNascimento
+  else
+    edtNascimento.Clear;
+
+  SelecionarCidade(FCliente.CidadeId);
+end;
+
+procedure TfrmCliente.TelaParaEntidade;
+begin
+  FCliente.Nome        := Trim(edtNome.Text);
+  FCliente.CpfCnpj     := TDocumento.SomenteDigitos(edtCpfCnpj.Text);
+  FCliente.Cep         := CepDigitado;
+  FCliente.Endereco    := Trim(edtEndereco.Text);
+  FCliente.Numero      := Trim(edtNumero.Text);
+  FCliente.Complemento := Trim(edtComplemento.Text);
+  FCliente.Bairro      := Trim(edtBairro.Text);
+  FCliente.CidadeId    := CidadeSelecionada;
+
+  if VarIsNull(edtNascimento.EditValue) or VarIsEmpty(edtNascimento.EditValue) then
+    FCliente.DataNascimento := 0
+  else
+    FCliente.DataNascimento := edtNascimento.Date;
+end;
+
+{ ---------------------------------------------------------------------------
+  CEP
+  --------------------------------------------------------------------------- }
+
+{ O campo tem mascara, entao Text vem como '01310-200' ou, vazio, como
+  '_____-___'. SomenteDigitos resolve os dois casos sem a tela precisar saber
+  como a mascara foi configurada. }
+function TfrmCliente.CepDigitado: string;
+begin
+  Result := TViaCepService.SomenteDigitos(edtCep.Text);
+end;
+
+procedure TfrmCliente.edtCepPropertiesChange(Sender: TObject);
+begin
+  { Digitou algo diferente: o CEP volta a ser "nao consultado", e a proxima
+    saida do campo dispara a busca. }
+  if CepDigitado <> FCepConsultado then
+    FCepConsultado := '';
+end;
+
+procedure TfrmCliente.edtCepExit(Sender: TObject);
+begin
+  ConsultarCep;
+end;
+
+procedure TfrmCliente.ConsultarCep;
+var
+  LCep: string;
+  LResultado: TResultadoCep;
+begin
+  LCep := CepDigitado;
+
+  { Nada a fazer: campo vazio, incompleto, ou CEP que ja foi consultado. }
+  if (LCep = '') or (LCep = FCepConsultado) then
+    Exit;
+
+  if not TViaCepService.FormatoValido(LCep) then
+    Exit;
+
+  Screen.Cursor := crHourGlass;
+  try
+    LResultado := FController.ConsultarCep(LCep);
+  finally
+    Screen.Cursor := crDefault;
+  end;
+
+  { Marca como consultado mesmo quando falha: sem isso, um CEP inexistente
+    faria a tela consultar a internet de novo a cada saida do campo. }
+  FCepConsultado := LCep;
+
+  if not LResultado.Sucesso then
+  begin
+    ShowMessage(LResultado.Mensagem);
+    Exit;
+  end;
+
+  { Antes de aplicar o resultado, a entidade precisa estar com o que o usuario
+    ja digitou - senao AplicarCep sobrescreveria a entidade antiga e a tela
+    seria repintada com dados velhos. }
+  TelaParaEntidade;
+  FController.AplicarCep(FCliente, LResultado);
+  EntidadeParaTela;
+
+  { CEP valido cuja cidade nao esta no nosso cadastro: o endereco foi
+    preenchido, mas o usuario ainda precisa escolher a cidade. }
+  if LResultado.Mensagem <> '' then
+    ShowMessage(LResultado.Mensagem);
+end;
+
+{ ---------------------------------------------------------------------------
+  CPF / CNPJ
+  --------------------------------------------------------------------------- }
+
+{ Reescreve o campo ja formatado. E so apresentacao: a validacao de verdade
+  (digito verificador) fica em Service.Documento e e disparada pelo Controller
+  na hora de salvar. Formatar aqui nao substitui validar la. }
+procedure TfrmCliente.edtCpfCnpjExit(Sender: TObject);
+begin
+  edtCpfCnpj.Text := TDocumento.Formatar(edtCpfCnpj.Text);
+end;
+
+{ ---------------------------------------------------------------------------
+  Gravacao
+  --------------------------------------------------------------------------- }
+
+procedure TfrmCliente.btnSalvarClick(Sender: TObject);
+begin
+  TelaParaEntidade;
+
+  try
+    FController.Salvar(FCliente);
+  except
+    { ERegraNegocio ja vem com a mensagem escrita para o usuario final, com
+      TODAS as criticas de uma vez. A tela so mostra e continua aberta, com o
+      que o usuario digitou intacto. Qualquer outra excecao sobe: erro
+      inesperado deve aparecer como erro inesperado. }
+    on E: ERegraNegocio do
+    begin
+      ShowMessage(E.Message);
+      Exit;
+    end;
+  end;
+
+  ModalResult := mrOk;
+end;
+
+procedure TfrmCliente.btnCancelarClick(Sender: TObject);
+begin
+  ModalResult := mrCancel;
+end;
+
+end.

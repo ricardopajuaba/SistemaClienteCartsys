@@ -1,0 +1,100 @@
+unit DAO.Estado;
+
+{ ============================================================================
+  Acesso a dados da tabela ESTADO.
+
+  O PADRAO DAO (Data Access Object)
+  Toda a conversa com o banco sobre ESTADO acontece aqui dentro. Nenhuma tela
+  monta SQL. A vantagem pratica: se amanha a consulta precisar mudar, muda em
+  um lugar so - e da para testar esta classe sem abrir formulario nenhum.
+
+  Repare que os metodos devolvem OBJETOS (TEstado), nao DataSets. Quem chama
+  nao precisa saber que existe FireDAC do outro lado.
+  ============================================================================ }
+
+interface
+
+uses
+  System.SysUtils,
+  System.Generics.Collections,
+  Data.DB,
+  FireDAC.Stan.Param,
+  FireDAC.Comp.Client,
+  Model.Entity.Estado;
+
+type
+  TEstadoDAO = class
+  private
+    function MontarEntidade(AQuery: TFDQuery): TEstado;
+  public
+    { Lista todos os estados em ordem alfabetica.
+      IMPORTANTE: quem chama fica dono da lista e deve libera-la. }
+    function Listar: TObjectList<TEstado>;
+
+    function ObterPorId(AId: Integer): TEstado;
+  end;
+
+implementation
+
+uses
+  DAO.Conexao;
+
+function TEstadoDAO.MontarEntidade(AQuery: TFDQuery): TEstado;
+begin
+  Result := TEstado.Create;
+  try
+    Result.Id   := AQuery.FieldByName('ID').AsInteger;
+    Result.Nome := AQuery.FieldByName('NOME').AsString;
+    Result.Uf   := Trim(AQuery.FieldByName('UF').AsString);
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+function TEstadoDAO.Listar: TObjectList<TEstado>;
+var
+  LQuery: TFDQuery;
+begin
+  { OwnsObjects = True: ao liberar a lista, os estados vao junto }
+  Result := TObjectList<TEstado>.Create(True);
+  try
+    LQuery := TConexao.Obter.NovaQuery;
+    try
+      LQuery.SQL.Text := 'SELECT ID, NOME, UF FROM ESTADO ORDER BY NOME';
+      LQuery.Open;
+      while not LQuery.Eof do
+      begin
+        Result.Add(MontarEntidade(LQuery));
+        LQuery.Next;
+      end;
+    finally
+      LQuery.Free;
+    end;
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+function TEstadoDAO.ObterPorId(AId: Integer): TEstado;
+var
+  LQuery: TFDQuery;
+begin
+  Result := nil;
+  LQuery := TConexao.Obter.NovaQuery;
+  try
+    { Parametro, nunca concatenacao. Alem de evitar SQL injection, o Firebird
+      reaproveita o plano de execucao da consulta. }
+    LQuery.SQL.Text := 'SELECT ID, NOME, UF FROM ESTADO WHERE ID = :ID';
+    LQuery.ParamByName('ID').AsInteger := AId;
+    LQuery.Open;
+
+    if not LQuery.IsEmpty then
+      Result := MontarEntidade(LQuery);
+  finally
+    LQuery.Free;
+  end;
+end;
+
+end.

@@ -1,0 +1,424 @@
+unit View.ClientePesquisa;
+
+{ ============================================================================
+  Tela de consulta de clientes.
+
+  Atende o item do teste que pede pesquisa por ID, nome, CPF/CNPJ, CEP,
+  cidade, estado e data de nascimento, e e a porta de entrada do cadastro:
+  daqui o usuario inclui, altera e exclui.
+
+  O cxGrid E USADO NO MODO NAO-LIGADO (unbound). POR QUE?
+
+  O caminho mais curto seria jogar um TFDQuery na tela, ligar um DataSource e
+  usar um cxGridDBTableView. Funciona - e joga fora a arquitetura inteira: o
+  SQL voltaria para dentro do formulario e a regra de negocio deixaria de ser
+  testavel sem abrir a tela (exatamente o contrario do que os 68 testes
+  automatizados deste projeto provam).
+
+  Entao o grid e alimentado a partir da TObjectList<TCliente> que o Controller
+  devolve, escrevendo direto no DataController:
+
+      DataController.RecordCount := <quantidade>
+      DataController.Values[linha, coluna] := <valor>
+
+  Custa umas poucas linhas a mais e mantem a tela sem saber o que e SQL. De
+  quebra, o grid continua fazendo tudo que ele sabe fazer: ordenar clicando
+  no cabecalho, filtrar pela linha de filtro e agrupar arrastando a coluna.
+
+  POR QUE RELER O CLIENTE DO BANCO AO ALTERAR?
+  O grid guarda uma fotografia do momento da consulta. Entre a consulta e o
+  duplo clique, outra pessoa pode ter alterado o registro. Por isso o que vai
+  para a tela de cadastro e sempre o resultado de um ObterPorId novo, e nao o
+  objeto que ficou na memoria.
+  ============================================================================ }
+
+interface
+
+uses
+  System.SysUtils,
+  System.Classes,
+  System.Variants,
+  System.UITypes,
+  System.Generics.Collections,
+  Winapi.Windows,
+  Vcl.Forms,
+  Vcl.Controls,
+  Vcl.Graphics,
+  Vcl.Dialogs,
+  Vcl.ExtCtrls,
+  Vcl.StdCtrls,
+  cxGraphics,
+  cxControls,
+  cxLookAndFeels,
+  cxLookAndFeelPainters,
+  cxStyles,
+  cxCustomData,
+  cxFilter,
+  cxData,
+  cxDataStorage,
+  cxEdit,
+  cxNavigator,
+  dxDateRanges,
+  dxScrollbarAnnotations,
+  cxClasses,
+  cxGridCustomView,
+  cxGridCustomTableView,
+  cxGridTableView,
+  cxGrid,
+  cxGridLevel,
+  cxContainer,
+  cxTextEdit,
+  cxMaskEdit,
+  cxDropDownEdit,
+  cxCalendar,
+  cxLabel,
+  cxButtons,
+  Model.Entity.Cliente,
+  DAO.Cliente,
+  Controller.Cliente, Vcl.Menus;
+
+type
+  TfrmClientePesquisa = class(TForm)
+    pnlFiltro: TPanel;
+    lblCampo: TcxLabel;
+    cbCampo: TcxComboBox;
+    lblValor: TcxLabel;
+    edtValor: TcxTextEdit;
+    btnPesquisar: TcxButton;
+    pnlAcoes: TPanel;
+    btnNovo: TcxButton;
+    btnAlterar: TcxButton;
+    btnExcluir: TcxButton;
+    btnFechar: TcxButton;
+    grdClientes: TcxGrid;
+    tvClientes: TcxGridTableView;
+    lvClientes: TcxGridLevel;
+    colId: TcxGridColumn;
+    colNome: TcxGridColumn;
+    colCpfCnpj: TcxGridColumn;
+    colCep: TcxGridColumn;
+    colEndereco: TcxGridColumn;
+    colNumero: TcxGridColumn;
+    colBairro: TcxGridColumn;
+    colCidade: TcxGridColumn;
+    colUf: TcxGridColumn;
+    colNascimento: TcxGridColumn;
+    procedure FormCreate(Sender: TObject);
+    procedure FormDestroy(Sender: TObject);
+    procedure FormShow(Sender: TObject);
+    procedure btnPesquisarClick(Sender: TObject);
+    procedure btnNovoClick(Sender: TObject);
+    procedure btnAlterarClick(Sender: TObject);
+    procedure btnExcluirClick(Sender: TObject);
+    procedure btnFecharClick(Sender: TObject);
+    procedure tvClientesCellDblClick(Sender: TcxCustomGridTableView;
+      ACellViewInfo: TcxGridTableDataCellViewInfo; AButton: TMouseButton;
+      AShift: TShiftState; var AHandled: Boolean);
+  private
+    FController: TClienteController;
+    FClientes: TObjectList<TCliente>;
+
+    procedure PrepararCombo;
+    function CampoSelecionado: TCampoPesquisa;
+
+    procedure Pesquisar;
+    procedure PreencherGrid;
+
+    { ID do cliente em foco no grid; 0 quando nao ha linha selecionada.
+
+      Le o valor da COLUNA de ID em vez de usar a posicao na lista porque o
+      usuario pode ter reordenado o grid clicando no cabecalho - e ai posicao
+      de linha e posicao na lista deixam de coincidir. }
+    function IdEmFoco: Integer;
+
+    procedure FocalizarId(AId: Integer);
+
+    { Abre o cadastro. AId = 0 significa inclusao. Devolve True se gravou. }
+    function AbrirCadastro(AId: Integer): Boolean;
+  end;
+
+implementation
+
+uses
+  View.Cliente,
+  Service.EnterTab,
+  Service.Documento,
+  Service.ViaCep;
+
+{$R *.dfm}
+
+{ ---------------------------------------------------------------------------
+  Ciclo de vida
+  --------------------------------------------------------------------------- }
+
+procedure TfrmClientePesquisa.FormCreate(Sender: TObject);
+begin
+  FController := TClienteController.Create;
+
+  { A lista e OwnsObjects = True: destruir a lista destroi os clientes.
+    Ela pertence a esta tela a partir daqui - ver o comentario na declaracao
+    de TClienteController.Pesquisar. }
+  FClientes := nil;
+
+  PrepararCombo;
+
+  { Exigencia do teste: Enter funcionando como Tab. Uma linha, no OnCreate,
+    para a tela inteira - ver Service.EnterTab. }
+  TEnterComoTab.Instalar(Self);
+end;
+
+procedure TfrmClientePesquisa.FormDestroy(Sender: TObject);
+begin
+  FreeAndNil(FClientes);
+  FreeAndNil(FController);
+end;
+
+procedure TfrmClientePesquisa.FormShow(Sender: TObject);
+begin
+  { Abrir ja listando tudo evita a tela vazia que faz o usuario perguntar se
+    o sistema carregou. }
+  Pesquisar;
+end;
+
+{ ---------------------------------------------------------------------------
+  Combo de campo de pesquisa
+
+  A ordem dos itens acompanha, item por item, a ordem do enum TCampoPesquisa
+  declarado em DAO.Cliente:
+
+      cpTodos, cpId, cpNome, cpCpfCnpj, cpCep, cpCidade, cpEstado,
+      cpDataNascimento
+
+  Assim a conversao e um cast direto do ItemIndex, sem tabela de-para. Se um
+  campo novo for acrescentado ao enum, ele precisa ser acrescentado aqui na
+  mesma posicao - por isso o combo e montado em codigo, e nao no .dfm: aqui
+  a correspondencia fica visivel ao lado do comentario que a explica.
+  --------------------------------------------------------------------------- }
+
+procedure TfrmClientePesquisa.PrepararCombo;
+begin
+  cbCampo.Properties.Items.Clear;
+  cbCampo.Properties.Items.Add('Todos');
+  cbCampo.Properties.Items.Add('ID');
+  cbCampo.Properties.Items.Add('Nome');
+  cbCampo.Properties.Items.Add('CPF / CNPJ');
+  cbCampo.Properties.Items.Add('CEP');
+  cbCampo.Properties.Items.Add('Cidade');
+  cbCampo.Properties.Items.Add('Estado (UF ou nome)');
+  cbCampo.Properties.Items.Add('Data de nascimento');
+  cbCampo.ItemIndex := 0;
+end;
+
+function TfrmClientePesquisa.CampoSelecionado: TCampoPesquisa;
+begin
+  if (cbCampo.ItemIndex < 0) or
+     (cbCampo.ItemIndex > Ord(High(TCampoPesquisa))) then
+    Result := cpTodos
+  else
+    Result := TCampoPesquisa(cbCampo.ItemIndex);
+end;
+
+{ ---------------------------------------------------------------------------
+  Pesquisa
+  --------------------------------------------------------------------------- }
+
+procedure TfrmClientePesquisa.Pesquisar;
+var
+  LIdAnterior: Integer;
+begin
+  { Guarda quem estava em foco para devolver o foco ao mesmo cliente depois
+    de recarregar - senao o usuario "perde o lugar" a cada operacao. }
+  LIdAnterior := IdEmFoco;
+
+  Screen.Cursor := crHourGlass;
+  try
+    FreeAndNil(FClientes);
+    FClientes := FController.Pesquisar(CampoSelecionado, edtValor.Text);
+    PreencherGrid;
+  finally
+    Screen.Cursor := crDefault;
+  end;
+
+  if LIdAnterior > 0 then
+    FocalizarId(LIdAnterior);
+end;
+
+procedure TfrmClientePesquisa.PreencherGrid;
+var
+  I: Integer;
+  LCliente: TCliente;
+begin
+  { BeginUpdate/EndUpdate: sem isso o grid se redesenha a cada celula, e uma
+    lista de algumas centenas de linhas ja pisca de forma perceptivel. }
+  tvClientes.BeginUpdate;
+  try
+    tvClientes.DataController.RecordCount := 0;
+
+    if not Assigned(FClientes) then
+      Exit;
+
+    tvClientes.DataController.RecordCount := FClientes.Count;
+
+    for I := 0 to FClientes.Count - 1 do
+    begin
+      LCliente := FClientes[I];
+
+      tvClientes.DataController.Values[I, colId.Index]       := LCliente.Id;
+      tvClientes.DataController.Values[I, colNome.Index]     := LCliente.Nome;
+      tvClientes.DataController.Values[I, colCpfCnpj.Index]  :=
+        TDocumento.Formatar(LCliente.CpfCnpj);
+      tvClientes.DataController.Values[I, colCep.Index]      :=
+        TViaCepService.Formatar(LCliente.Cep);
+      tvClientes.DataController.Values[I, colEndereco.Index] := LCliente.Endereco;
+      tvClientes.DataController.Values[I, colNumero.Index]   := LCliente.Numero;
+      tvClientes.DataController.Values[I, colBairro.Index]   := LCliente.Bairro;
+      tvClientes.DataController.Values[I, colCidade.Index]   := LCliente.NomeCidade;
+      tvClientes.DataController.Values[I, colUf.Index]       := LCliente.Uf;
+
+      { Data nula na entidade e 0. Mandar 0 para o grid mostraria 30/12/1899;
+        Null deixa a celula em branco, que e o certo. }
+      if LCliente.DataNascimento > 0 then
+        tvClientes.DataController.Values[I, colNascimento.Index] :=
+          LCliente.DataNascimento
+      else
+        tvClientes.DataController.Values[I, colNascimento.Index] := Null;
+    end;
+  finally
+    tvClientes.EndUpdate;
+  end;
+end;
+
+function TfrmClientePesquisa.IdEmFoco: Integer;
+var
+  LIndice: Integer;
+  LValor: Variant;
+begin
+  Result := 0;
+
+  LIndice := tvClientes.DataController.FocusedRecordIndex;
+  if (LIndice < 0) or (LIndice >= tvClientes.DataController.RecordCount) then
+    Exit;
+
+  LValor := tvClientes.DataController.Values[LIndice, colId.Index];
+  if VarIsNull(LValor) or VarIsEmpty(LValor) then
+    Exit;
+
+  Result := LValor;
+end;
+
+procedure TfrmClientePesquisa.FocalizarId(AId: Integer);
+var
+  I: Integer;
+  LValor: Variant;
+begin
+  for I := 0 to tvClientes.DataController.RecordCount - 1 do
+  begin
+    LValor := tvClientes.DataController.Values[I, colId.Index];
+    if (not VarIsNull(LValor)) and (Integer(LValor) = AId) then
+    begin
+      tvClientes.DataController.FocusedRecordIndex := I;
+      Exit;
+    end;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------
+  Acoes
+  --------------------------------------------------------------------------- }
+
+procedure TfrmClientePesquisa.btnPesquisarClick(Sender: TObject);
+begin
+  Pesquisar;
+end;
+
+function TfrmClientePesquisa.AbrirCadastro(AId: Integer): Boolean;
+var
+  LForm: TfrmCliente;
+begin
+  LForm := TfrmCliente.Create(Self);
+  try
+    LForm.Carregar(AId);
+    Result := LForm.ShowModal = mrOk;
+  finally
+    LForm.Free;
+  end;
+end;
+
+procedure TfrmClientePesquisa.btnNovoClick(Sender: TObject);
+begin
+  if AbrirCadastro(0) then
+    Pesquisar;
+end;
+
+procedure TfrmClientePesquisa.btnAlterarClick(Sender: TObject);
+var
+  LId: Integer;
+begin
+  LId := IdEmFoco;
+  if LId = 0 then
+  begin
+    ShowMessage('Selecione um cliente na lista.');
+    Exit;
+  end;
+
+  if AbrirCadastro(LId) then
+    Pesquisar;
+end;
+
+procedure TfrmClientePesquisa.btnExcluirClick(Sender: TObject);
+var
+  LId: Integer;
+begin
+  LId := IdEmFoco;
+  if LId = 0 then
+  begin
+    ShowMessage('Selecione um cliente na lista.');
+    Exit;
+  end;
+
+  if MessageDlg(Format('Confirma a exclusao do cliente %d?', [LId]),
+       mtConfirmation, [mbYes, mbNo], 0) <> mrYes then
+    Exit;
+
+  try
+    FController.Excluir(LId);
+  except
+    { ERegraNegocio ja traz a mensagem pronta para o usuario final - inclusive
+      a dos IDs protegidos (1, 5, 8, 10 e 15). Qualquer outra excecao NAO e
+      capturada aqui de proposito: erro inesperado deve aparecer como erro
+      inesperado, e nao ser disfarcado de aviso. }
+    on E: ERegraNegocio do
+    begin
+      ShowMessage(E.Message);
+      Exit;
+    end;
+  end;
+
+  Pesquisar;
+end;
+
+procedure TfrmClientePesquisa.btnFecharClick(Sender: TObject);
+begin
+  Close;
+end;
+
+{ Duplo clique na linha abre o cadastro - atalho que todo usuario de sistema
+  comercial espera encontrar.
+
+  Usamos OnCellDblClick, e nao um OnDblClick generico, porque este evento ja
+  chega com a celula clicada resolvida e com o AHandled: marcando AHandled
+  impedimos o grid de seguir com o tratamento padrao (entrar em edicao na
+  celula), que aqui nao faz sentido porque o grid e somente leitura. }
+procedure TfrmClientePesquisa.tvClientesCellDblClick(
+  Sender: TcxCustomGridTableView;
+  ACellViewInfo: TcxGridTableDataCellViewInfo; AButton: TMouseButton;
+  AShift: TShiftState; var AHandled: Boolean);
+begin
+  if AButton <> mbLeft then
+    Exit;
+
+  AHandled := True;
+  btnAlterarClick(Sender);
+end;
+
+end.

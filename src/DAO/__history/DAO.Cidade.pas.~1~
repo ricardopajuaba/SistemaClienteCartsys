@@ -1,0 +1,178 @@
+unit DAO.Cidade;
+
+{ ============================================================================
+  Acesso a dados da tabela CIDADE.
+
+  Todas as consultas ja trazem o estado junto (JOIN com ESTADO), porque na
+  pratica nenhuma tela mostra cidade sem a UF - seria uma segunda ida ao banco
+  para cada linha, o classico problema N+1.
+  ============================================================================ }
+
+interface
+
+uses
+  System.SysUtils,
+  System.Generics.Collections,
+  Data.DB,
+  FireDAC.Stan.Param,
+  FireDAC.Comp.Client,
+  Model.Entity.Cidade;
+
+type
+  TCidadeDAO = class
+  private
+    function MontarEntidade(AQuery: TFDQuery): TCidade;
+    function SqlBase: string;
+  public
+    function Listar: TObjectList<TCidade>;
+
+    { Usado no combo da tela de cadastro: ao escolher o estado, so as cidades
+      dele aparecem. }
+    function ListarPorEstado(AEstadoId: Integer): TObjectList<TCidade>;
+
+    function ObterPorId(AId: Integer): TCidade;
+
+    { Usado pela integracao com o ViaCEP: a API devolve o NOME da cidade e a
+      UF, e precisamos descobrir o ID correspondente no nosso banco.
+      Devolve nil quando a cidade retornada pelo CEP nao esta cadastrada. }
+    function ObterPorNomeUf(const ANome, AUf: string): TCidade;
+  end;
+
+implementation
+
+uses
+  DAO.Conexao,
+  Service.Texto;
+
+function TCidadeDAO.SqlBase: string;
+begin
+  Result :=
+    'SELECT C.ID, C.NOME, C.ESTADOID, E.NOME AS NOME_ESTADO, E.UF ' +
+    '  FROM CIDADE C ' +
+    '  JOIN ESTADO E ON E.ID = C.ESTADOID ';
+end;
+
+function TCidadeDAO.MontarEntidade(AQuery: TFDQuery): TCidade;
+begin
+  Result := TCidade.Create;
+  try
+    Result.Id         := AQuery.FieldByName('ID').AsInteger;
+    Result.Nome       := AQuery.FieldByName('NOME').AsString;
+    Result.EstadoId   := AQuery.FieldByName('ESTADOID').AsInteger;
+    Result.NomeEstado := AQuery.FieldByName('NOME_ESTADO').AsString;
+    Result.Uf         := Trim(AQuery.FieldByName('UF').AsString);
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+function TCidadeDAO.Listar: TObjectList<TCidade>;
+var
+  LQuery: TFDQuery;
+begin
+  Result := TObjectList<TCidade>.Create(True);
+  try
+    LQuery := TConexao.Obter.NovaQuery;
+    try
+      LQuery.SQL.Text := SqlBase + ' ORDER BY E.UF, C.NOME';
+      LQuery.Open;
+      while not LQuery.Eof do
+      begin
+        Result.Add(MontarEntidade(LQuery));
+        LQuery.Next;
+      end;
+    finally
+      LQuery.Free;
+    end;
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+function TCidadeDAO.ListarPorEstado(AEstadoId: Integer): TObjectList<TCidade>;
+var
+  LQuery: TFDQuery;
+begin
+  Result := TObjectList<TCidade>.Create(True);
+  try
+    LQuery := TConexao.Obter.NovaQuery;
+    try
+      LQuery.SQL.Text := SqlBase + ' WHERE C.ESTADOID = :ESTADOID ORDER BY C.NOME';
+      LQuery.ParamByName('ESTADOID').AsInteger := AEstadoId;
+      LQuery.Open;
+      while not LQuery.Eof do
+      begin
+        Result.Add(MontarEntidade(LQuery));
+        LQuery.Next;
+      end;
+    finally
+      LQuery.Free;
+    end;
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+function TCidadeDAO.ObterPorId(AId: Integer): TCidade;
+var
+  LQuery: TFDQuery;
+begin
+  Result := nil;
+  LQuery := TConexao.Obter.NovaQuery;
+  try
+    LQuery.SQL.Text := SqlBase + ' WHERE C.ID = :ID';
+    LQuery.ParamByName('ID').AsInteger := AId;
+    LQuery.Open;
+    if not LQuery.IsEmpty then
+      Result := MontarEntidade(LQuery);
+  finally
+    LQuery.Free;
+  end;
+end;
+
+function TCidadeDAO.ObterPorNomeUf(const ANome, AUf: string): TCidade;
+var
+  LQuery: TFDQuery;
+  LNomeProcurado: string;
+begin
+  Result := nil;
+  LNomeProcurado := TTexto.Normalizar(ANome);
+  if LNomeProcurado = '' then
+    Exit;
+
+  LQuery := TConexao.Obter.NovaQuery;
+  try
+    { Traz as cidades daquela UF e compara aqui, no Delphi, usando texto
+      normalizado (sem acento, em maiuscula).
+
+      POR QUE NAO COMPARAR DIRETO NO SQL?
+      Porque UPPER() do Firebird nao remove acento: para ele 'SAO PAULO' e
+      'SAO PAULO' com til sao strings diferentes. Como o ViaCEP pode devolver
+      o nome com ou sem acento, a comparacao precisa ignorar isso.
+
+      O CAST na UF e necessario porque a coluna e CHAR(2) - sem ele o Firebird
+      limita o parametro a 2 caracteres. }
+    LQuery.SQL.Text := SqlBase +
+      ' WHERE UPPER(CAST(E.UF AS VARCHAR(50))) = UPPER(:UF)' +
+      ' ORDER BY C.NOME';
+    LQuery.ParamByName('UF').AsString := Trim(AUf);
+    LQuery.Open;
+
+    while not LQuery.Eof do
+    begin
+      if TTexto.Normalizar(LQuery.FieldByName('NOME').AsString) = LNomeProcurado then
+      begin
+        Result := MontarEntidade(LQuery);
+        Break;
+      end;
+      LQuery.Next;
+    end;
+  finally
+    LQuery.Free;
+  end;
+end;
+
+end.

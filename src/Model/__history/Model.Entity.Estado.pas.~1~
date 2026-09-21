@@ -1,0 +1,41 @@
+unit Model.Entity.Estado;
+
+{ ============================================================================
+  Entidade ESTADO.
+
+  Por que uma classe em vez de usar o DataSet direto?
+  Porque assim as regras e o transporte de dados nao dependem do FireDAC. Se um
+  dia o banco mudar, ou os dados vierem de uma API, so o DAO muda - a entidade,
+  o Controller e a tela continuam iguais. Isso e o "M" do MVC.
+  ============================================================================ }
+
+interface
+
+type
+  TEstado = class
+  private
+    FId: Integer;
+    FNome: string;
+    FUf: string;
+  public
+    property Id: Integer read FId write FId;
+    property Nome: string read FNome write FNome;
+    property Uf: string read FUf write FUf;
+
+    function Descricao: string;
+  end;
+
+implementation
+
+uses
+  System.SysUtils;
+
+{ Usado nos combos e no relatorio: "Minas Gerais (MG)" }
+function TEstado.Descricao: string;
+begin
+  Result := Trim(FNome);
+  if Trim(FUf) <> '' then
+    Result := Result + ' (' + Trim(FUf) + ')';
+end;
+
+end.

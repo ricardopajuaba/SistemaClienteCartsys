@@ -1,0 +1,351 @@
+unit Controller.Cliente;
+
+{ ============================================================================
+  Controller do cadastro de clientes - o "C" do MVC.
+
+  QUAL E O PAPEL DELE?
+  Ficar entre a tela (View) e os dados (Model/DAO), coordenando a operacao:
+
+      View  ->  Controller  ->  Regras  ->  DAO  ->  Banco
+
+  A tela NAO conhece SQL, NAO conhece FireDAC e NAO sabe o que e transacao.
+  Ela pede "salva esse cliente" e recebe de volta ou sucesso, ou uma mensagem
+  pronta para mostrar ao usuario.
+
+  QUEM CONTROLA A TRANSACAO
+  E aqui. Esta e a fronteira da operacao de negocio: o Controller abre a
+  transacao, manda o DAO trabalhar e entao confirma ou desfaz TUDO. Por isso
+  os metodos do DAO nunca dao commit por conta propria - se dessem, uma
+  operacao que mexesse em duas tabelas nao teria como voltar atras.
+
+  Este padrao tem nome: Unit of Work.
+  ============================================================================ }
+
+interface
+
+uses
+  System.SysUtils,
+  System.Generics.Collections,
+  Model.Entity.Cliente,
+  Model.Entity.Cidade,
+  Model.Entity.Estado,
+  DAO.Cliente,
+  DAO.Cidade,
+  DAO.Estado,
+  Service.ViaCep;
+
+type
+  { Erro de regra de negocio. A tela trata esta excecao de forma diferente de
+    um erro inesperado: aqui a mensagem ja esta escrita para o usuario final,
+    entao basta mostrar - sem stack trace, sem "Access violation". }
+  ERegraNegocio = class(Exception);
+
+  { Resultado da consulta de CEP, ja resolvido contra o nosso cadastro }
+  TResultadoCep = record
+    Sucesso: Boolean;
+    Mensagem: string;
+    Endereco: string;
+    Bairro: string;
+    NomeCidade: string;
+    Uf: string;
+
+    { ID da cidade no nosso banco. Vem 0 quando o CEP e valido mas a cidade
+      nao esta cadastrada - a tela entao avisa e deixa o usuario escolher. }
+    CidadeId: Integer;
+  end;
+
+  TClienteController = class
+  private
+    FClienteDAO: TClienteDAO;
+    FCidadeDAO: TCidadeDAO;
+    FEstadoDAO: TEstadoDAO;
+  public
+    constructor Create;
+    destructor Destroy; override;
+
+    { ------------------------------- Consultas ------------------------------
+      As listas devolvidas pertencem a quem chamou - precisam de Free. }
+
+    function Pesquisar(ACampo: TCampoPesquisa;
+      const AValor: string): TObjectList<TCliente>;
+
+    function ObterPorId(AId: Integer): TCliente;
+
+    function ListarEstados: TObjectList<TEstado>;
+    function ListarCidades: TObjectList<TCidade>;
+    function ListarCidadesPorEstado(AEstadoId: Integer): TObjectList<TCidade>;
+
+    function ListarParaRelatorio(AFiltro: TFiltroRelatorio;
+      AIdInicial, AIdFinal, ACidadeId, AEstadoId: Integer): TObjectList<TCliente>;
+
+    { ------------------------------- Gravacao ------------------------------- }
+
+    { Insere ou altera, conforme o cliente ja tenha ID.
+      Levanta ERegraNegocio quando a validacao reprova - nada e gravado. }
+    procedure Salvar(ACliente: TCliente);
+
+    { Levanta ERegraNegocio para os IDs protegidos (1, 5, 8, 10, 15) }
+    procedure Excluir(AId: Integer);
+
+    { ------------------------------- Integracao ----------------------------- }
+
+    { Consulta o CEP no ViaCEP e ja tenta casar a cidade com o nosso cadastro }
+    function ConsultarCep(const ACep: string): TResultadoCep;
+
+    { Aplica na entidade o que veio do CEP. Mantem o que o usuario ja digitou
+      em Numero e Complemento, que o ViaCEP nao tem como saber. }
+    procedure AplicarCep(ACliente: TCliente; const AResultado: TResultadoCep);
+  end;
+
+implementation
+
+uses
+  DAO.Conexao,
+  Service.RegrasCliente,
+  Service.Texto;
+
+constructor TClienteController.Create;
+begin
+  inherited Create;
+  FClienteDAO := TClienteDAO.Create;
+  FCidadeDAO  := TCidadeDAO.Create;
+  FEstadoDAO  := TEstadoDAO.Create;
+end;
+
+destructor TClienteController.Destroy;
+begin
+  FEstadoDAO.Free;
+  FCidadeDAO.Free;
+  FClienteDAO.Free;
+  inherited Destroy;
+end;
+
+{ ---------------------------------------------------------------------------
+  Consultas
+
+  Todas encerram a transacao de leitura no final - ver o comentario de
+  TConexao.EncerrarLeitura sobre por que isso importa no Firebird.
+  --------------------------------------------------------------------------- }
+
+function TClienteController.Pesquisar(ACampo: TCampoPesquisa;
+  const AValor: string): TObjectList<TCliente>;
+begin
+  try
+    Result := FClienteDAO.Pesquisar(ACampo, AValor);
+  finally
+    TConexao.Obter.EncerrarLeitura;
+  end;
+end;
+
+function TClienteController.ObterPorId(AId: Integer): TCliente;
+begin
+  try
+    Result := FClienteDAO.ObterPorId(AId);
+  finally
+    TConexao.Obter.EncerrarLeitura;
+  end;
+end;
+
+function TClienteController.ListarEstados: TObjectList<TEstado>;
+begin
+  try
+    Result := FEstadoDAO.Listar;
+  finally
+    TConexao.Obter.EncerrarLeitura;
+  end;
+end;
+
+function TClienteController.ListarCidades: TObjectList<TCidade>;
+begin
+  try
+    Result := FCidadeDAO.Listar;
+  finally
+    TConexao.Obter.EncerrarLeitura;
+  end;
+end;
+
+function TClienteController.ListarCidadesPorEstado(
+  AEstadoId: Integer): TObjectList<TCidade>;
+begin
+  try
+    Result := FCidadeDAO.ListarPorEstado(AEstadoId);
+  finally
+    TConexao.Obter.EncerrarLeitura;
+  end;
+end;
+
+function TClienteController.ListarParaRelatorio(AFiltro: TFiltroRelatorio;
+  AIdInicial, AIdFinal, ACidadeId, AEstadoId: Integer): TObjectList<TCliente>;
+begin
+  { Faixa invertida e engano comum do usuario: em vez de devolver nada,
+    corrigimos silenciosamente. }
+  if (AFiltro = frFaixaId) and (AIdInicial > AIdFinal) then
+  begin
+    AIdFinal := AIdInicial xor AIdFinal;
+    AIdInicial := AIdInicial xor AIdFinal;
+    AIdFinal := AIdInicial xor AIdFinal;
+  end;
+
+  try
+    Result := FClienteDAO.ListarParaRelatorio(
+      AFiltro, AIdInicial, AIdFinal, ACidadeId, AEstadoId);
+  finally
+    TConexao.Obter.EncerrarLeitura;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------
+  Gravacao
+  --------------------------------------------------------------------------- }
+
+procedure TClienteController.Salvar(ACliente: TCliente);
+var
+  LCriticas: string;
+  LDocumento: string;
+begin
+  if ACliente = nil then
+    raise ERegraNegocio.Create('Nenhum cliente informado.');
+
+  { 1) Validacao ANTES de encostar no banco. Nao faz sentido abrir transacao
+       para descobrir depois que o nome estava em branco. }
+  LCriticas := TRegrasCliente.Criticar(ACliente);
+  if LCriticas <> '' then
+    raise ERegraNegocio.Create(
+      'Nao foi possivel salvar:' + sLineBreak + sLineBreak + LCriticas);
+
+  { 2) Unicidade do documento. Fica fora de TRegrasCliente porque depende do
+       banco, e aquela classe e de regra pura - sem acesso a dados. }
+  LDocumento := Trim(ACliente.CpfCnpj);
+  if LDocumento <> '' then
+    if FClienteDAO.CpfCnpjEmUso(LDocumento, ACliente.Id) then
+      raise ERegraNegocio.CreateFmt(
+        'O CPF/CNPJ %s ja esta cadastrado para outro cliente.', [LDocumento]);
+
+  { 3) Gravacao propriamente dita, dentro da transacao }
+  TConexao.Obter.IniciarTransacao;
+  try
+    if ACliente.EhNovo then
+      FClienteDAO.Inserir(ACliente)
+    else
+      FClienteDAO.Alterar(ACliente);
+
+    TConexao.Obter.Confirmar;
+  except
+    { Qualquer falha desfaz tudo e o erro sobe para a tela tratar }
+    TConexao.Obter.Desfazer;
+    raise;
+  end;
+end;
+
+procedure TClienteController.Excluir(AId: Integer);
+var
+  LCritica: string;
+begin
+  { A regra dos IDs protegidos e conferida aqui para o usuario receber uma
+    mensagem clara. O banco tem a mesma regra num trigger, como rede de
+    seguranca - ver Service.RegrasCliente. }
+  LCritica := TRegrasCliente.CriticarExclusao(AId);
+  if LCritica <> '' then
+    raise ERegraNegocio.Create(LCritica);
+
+  TConexao.Obter.IniciarTransacao;
+  try
+    FClienteDAO.Excluir(AId);
+    TConexao.Obter.Confirmar;
+  except
+    on E: Exception do
+    begin
+      TConexao.Obter.Desfazer;
+
+      { Se o trigger do banco barrou, a mensagem tecnica do Firebird nao serve
+        para o usuario final - trocamos por uma legivel. }
+      if Pos('EX_CLIENTE_PROTEGIDO', UpperCase(E.Message)) > 0 then
+        raise ERegraNegocio.Create(TRegrasCliente.CriticarExclusao(AId));
+
+      raise;
+    end;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------
+  Integracao com o ViaCEP
+  --------------------------------------------------------------------------- }
+
+function TClienteController.ConsultarCep(const ACep: string): TResultadoCep;
+var
+  LEndereco: TEnderecoCep;
+  LCidade: TCidade;
+begin
+  Result.Sucesso    := False;
+  Result.Mensagem   := '';
+  Result.Endereco   := '';
+  Result.Bairro     := '';
+  Result.NomeCidade := '';
+  Result.Uf         := '';
+  Result.CidadeId   := 0;
+
+  LEndereco := TViaCepService.Consultar(ACep);
+
+  if not LEndereco.Encontrado then
+  begin
+    Result.Mensagem := LEndereco.Erro;
+    Exit;
+  end;
+
+  Result.Sucesso    := True;
+  Result.Endereco   := LEndereco.Logradouro;
+  Result.Bairro     := LEndereco.Bairro;
+  Result.NomeCidade := LEndereco.Cidade;
+  Result.Uf         := LEndereco.Uf;
+
+  { Agora traduzimos o nome da cidade que veio da API para o ID do nosso
+    cadastro. A comparacao ignora acento e caixa - ver Service.Texto. }
+  try
+    LCidade := FCidadeDAO.ObterPorNomeUf(LEndereco.Cidade, LEndereco.Uf);
+  finally
+    TConexao.Obter.EncerrarLeitura;
+  end;
+
+  if Assigned(LCidade) then
+  try
+    Result.CidadeId := LCidade.Id;
+  finally
+    LCidade.Free;
+  end
+  else
+    { CEP valido, cidade fora do nosso cadastro. Nao e erro: o endereco foi
+      preenchido, so a cidade fica para o usuario escolher. }
+    Result.Mensagem := Format(
+      'Endereco encontrado, mas a cidade %s/%s nao esta cadastrada.' +
+      sLineBreak + 'Selecione a cidade manualmente.',
+      [LEndereco.Cidade, LEndereco.Uf]);
+end;
+
+procedure TClienteController.AplicarCep(ACliente: TCliente;
+  const AResultado: TResultadoCep);
+begin
+  if (ACliente = nil) or (not AResultado.Sucesso) then
+    Exit;
+
+  ACliente.Cep := TViaCepService.SomenteDigitos(ACliente.Cep);
+
+  { So sobrescreve o que a API realmente trouxe. CEP de cidade pequena costuma
+    vir sem logradouro e sem bairro - nesse caso preservamos o que o usuario
+    ja tinha digitado em vez de apagar. }
+  if Trim(AResultado.Endereco) <> '' then
+    ACliente.Endereco := AResultado.Endereco;
+
+  if Trim(AResultado.Bairro) <> '' then
+    ACliente.Bairro := AResultado.Bairro;
+
+  if AResultado.CidadeId > 0 then
+  begin
+    ACliente.CidadeId   := AResultado.CidadeId;
+    ACliente.NomeCidade := AResultado.NomeCidade;
+    ACliente.Uf         := AResultado.Uf;
+  end;
+
+  { Numero e Complemento nunca sao tocados: o ViaCEP nao tem essa informacao }
+end;
+
+end.

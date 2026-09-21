@@ -1,0 +1,185 @@
+unit Service.EnterTab;
+
+{ ============================================================================
+  Enter funcionando como Tab (exigencia do teste).
+
+  COMO FUNCIONA
+  O formulario liga KeyPreview, o que faz TODA tecla passar primeiro por ele
+  antes de chegar ao controle focado. Ao ver um Enter, trocamos a tecla por
+  "nada" e mandamos o Windows avancar para o proximo controle na ordem de
+  TabOrder - exatamente o que o Tab faria.
+
+  Usar WM_NEXTDLGCTL em vez de SelectNext e proposital: ele respeita a ordem
+  de tabulacao inclusive atravessando paineis e group boxes aninhados, que e
+  onde o SelectNext costuma se perder.
+
+  ONDE O ENTER NAO PODE VIRAR TAB
+  Trocar Enter por Tab em todo lugar quebra a tela em tres situacoes:
+
+    - Botao focado: Enter tem que acionar o botao, nao pular fora dele;
+    - Memo de varias linhas: Enter tem que quebrar linha;
+    - Combo aberto: Enter tem que confirmar o item destacado.
+
+  Esses casos sao detectados e deixados passar.
+
+  POR QUE COMPARAR NOME DE CLASSE EM VEZ DE USAR "is"
+  Porque esta unit NAO depende do DevExpress. Se ela usasse "is TcxMemo",
+  passaria a exigir os pacotes da DevExpress para compilar, e nao daria mais
+  para testar nada sem eles. Comparando o nome da classe, o mesmo codigo
+  atende TMemo, TDBMemo, TcxMemo, TcxDBMemo e qualquer outro que apareca.
+  E uma troca consciente: perde-se checagem do compilador, ganha-se
+  independencia da camada visual.
+  ============================================================================ }
+
+interface
+
+uses
+  System.SysUtils,
+  System.Classes,
+  Winapi.Windows,
+  Winapi.Messages,
+  Vcl.Forms,
+  Vcl.Controls,
+  Vcl.StdCtrls;
+
+type
+  TEnterComoTab = class(TComponent)
+  private
+    FFormulario: TCustomForm;
+    FEventoAnterior: TKeyPressEvent;
+    procedure AoPressionarTecla(Sender: TObject; var Key: Char);
+  public
+    { Instala o comportamento no formulario. O objeto criado pertence ao
+      proprio formulario, entao e destruido junto com ele - nao precisa
+      guardar referencia nem dar Free.
+
+      Uso, no OnCreate do form:
+          TEnterComoTab.Instalar(Self); }
+    class procedure Instalar(AFormulario: TCustomForm);
+
+    { Versao manual, para quem preferir chamar do proprio OnKeyPress:
+          procedure TFrm.FormKeyPress(Sender: TObject; var Key: Char);
+          begin
+            TEnterComoTab.Tratar(Self, Key);
+          end; }
+    class procedure Tratar(AFormulario: TCustomForm; var Key: Char);
+
+    { True quando o controle focado precisa receber o Enter de verdade }
+    class function ControleConsomeEnter(AControle: TWinControl): Boolean;
+  end;
+
+implementation
+
+type
+  { "Class crackers".
+
+    WantReturns e DroppedDown sao declaradas como protected nas classes base da
+    VCL, e o Delphi so libera membros protegidos para descendentes. Declarar um
+    descendente vazio aqui torna esses membros acessiveis dentro desta unit,
+    sem precisar alterar a VCL nem fazer type cast inseguro.
+
+    E um idioma antigo e consagrado do Delphi - vale conhecer, porque aparece
+    bastante em codigo VCL de verdade. }
+  TMemoCracker  = class(TCustomMemo);
+  TComboCracker = class(TCustomComboBox);
+
+{ ---------------------------------------------------------------------------
+  Deteccao dos controles que precisam do Enter
+  --------------------------------------------------------------------------- }
+
+class function TEnterComoTab.ControleConsomeEnter(
+  AControle: TWinControl): Boolean;
+var
+  LNomeClasse: string;
+begin
+  Result := False;
+  if not Assigned(AControle) then
+    Exit;
+
+  LNomeClasse := UpperCase(AControle.ClassName);
+
+  { Botoes: o Enter precisa aciona-los }
+  if (AControle is TButtonControl) or
+     (Pos('BUTTON', LNomeClasse) > 0) then
+    Exit(True);
+
+  { Memos: o Enter quebra linha.
+    O teste do WantReturns cobre os memos da VCL; a comparacao por nome cobre
+    os da DevExpress sem criar dependencia de compilacao com eles. }
+  if AControle is TCustomMemo then
+    Exit(TMemoCracker(AControle).WantReturns);
+
+  if Pos('MEMO', LNomeClasse) > 0 then
+    Exit(True);
+
+  { Combos com a lista aberta: o Enter confirma o item destacado }
+  if AControle is TCustomComboBox then
+    Exit(TComboCracker(AControle).DroppedDown);
+
+  if (Pos('COMBO', LNomeClasse) > 0) or (Pos('LOOKUP', LNomeClasse) > 0) then
+  begin
+    { Nao da para ler DroppedDown sem conhecer a classe. Perguntamos ao
+      proprio controle via mensagem padrao do Windows, que os combos da VCL e
+      os da DevExpress respondem igual. }
+    Result := AControle.Perform(CB_GETDROPPEDSTATE, 0, 0) <> 0;
+    Exit;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------
+  Tratamento
+  --------------------------------------------------------------------------- }
+
+class procedure TEnterComoTab.Tratar(AFormulario: TCustomForm; var Key: Char);
+begin
+  if Key <> #13 then
+    Exit;
+
+  if not Assigned(AFormulario) then
+    Exit;
+
+  if ControleConsomeEnter(AFormulario.ActiveControl) then
+    Exit;
+
+  { Zera a tecla para o Windows nao emitir o "beep" de tecla nao tratada }
+  Key := #0;
+
+  AFormulario.Perform(WM_NEXTDLGCTL, 0, 0);
+end;
+
+{ ---------------------------------------------------------------------------
+  Instalacao automatica
+  --------------------------------------------------------------------------- }
+
+class procedure TEnterComoTab.Instalar(AFormulario: TCustomForm);
+var
+  LInstancia: TEnterComoTab;
+begin
+  if not Assigned(AFormulario) then
+    Exit;
+
+  { Owner e o formulario: o objeto morre junto com ele }
+  LInstancia := TEnterComoTab.Create(AFormulario);
+  LInstancia.FFormulario := AFormulario;
+
+  AFormulario.KeyPreview := True;
+
+  { Preserva um OnKeyPress que o formulario ja tivesse, para nao atropelar
+    tratamento proprio da tela }
+  if AFormulario is TForm then
+  begin
+    LInstancia.FEventoAnterior := TForm(AFormulario).OnKeyPress;
+    TForm(AFormulario).OnKeyPress := LInstancia.AoPressionarTecla;
+  end;
+end;
+
+procedure TEnterComoTab.AoPressionarTecla(Sender: TObject; var Key: Char);
+begin
+  Tratar(FFormulario, Key);
+
+  { Se o Enter nao foi consumido aqui, repassa para quem tratava antes }
+  if (Key <> #0) and Assigned(FEventoAnterior) then
+    FEventoAnterior(Sender, Key);
+end;
+
+end.

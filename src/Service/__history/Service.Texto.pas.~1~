@@ -1,0 +1,88 @@
+﻿unit Service.Texto;
+
+{ ============================================================================
+  Utilitarios de texto.
+
+  POR QUE ISTO EXISTE
+  O ViaCEP devolve "Sao Paulo" ou "Sao Paulo" conforme a origem do dado, e o
+  usuario digita de qualquer jeito na pesquisa. Ja o banco guarda o nome
+  oficial, acentuado. Comparar com UPPER() nao resolve: para o Firebird,
+  'SAO PAULO' e 'SAO PAULO' acentuado sao strings diferentes.
+
+  Entao, antes de comparar nomes de cidade, os dois lados passam por aqui:
+  vira maiuscula, perde acento e perde espaco sobrando. Assim "sao  paulo",
+  "Sao Paulo" e "SAO PAULO" acentuado todos batem.
+  ============================================================================ }
+
+interface
+
+uses
+  System.SysUtils;
+
+type
+  TTexto = class
+  public
+    { Troca cada caractere acentuado pelo equivalente sem acento }
+    class function RemoverAcentos(const AValor: string): string;
+
+    { Maiuscula + sem acento + sem espaco duplicado nas pontas.
+      Use este para COMPARAR textos digitados pelo usuario. }
+    class function Normalizar(const AValor: string): string;
+
+    { True quando os dois textos sao equivalentes ignorando acento e caixa }
+    class function Equivalentes(const A, B: string): Boolean;
+  end;
+
+implementation
+
+const
+  { Mapa posicional: cada caractere de COM_ACENTO vira o de mesma posicao em
+    SEM_ACENTO. Cobre o que aparece em nome de cidade e bairro no Brasil. }
+  COM_ACENTO =
+    'ÁÀÃÂÄáàãâä' +
+    'ÉÈÊËéèêë' +
+    'ÍÌÎÏíìîï' +
+    'ÓÒÕÔÖóòõôö' +
+    'ÚÙÛÜúùûü' +
+    'ÇçÑñÝýÿ';
+
+  SEM_ACENTO =
+    'AAAAAaaaaa' +
+    'EEEEeeee' +
+    'IIIIiiii' +
+    'OOOOOooooo' +
+    'UUUUuuuu' +
+    'CcNnYyy';
+
+class function TTexto.RemoverAcentos(const AValor: string): string;
+var
+  I, LPos: Integer;
+begin
+  Result := AValor;
+  for I := 1 to Length(Result) do
+  begin
+    LPos := Pos(Result[I], COM_ACENTO);
+    if LPos > 0 then
+      Result[I] := SEM_ACENTO[LPos];
+  end;
+end;
+
+class function TTexto.Normalizar(const AValor: string): string;
+var
+  LAnterior: string;
+begin
+  Result := UpperCase(RemoverAcentos(Trim(AValor)));
+
+  { Colapsa espacos repetidos no meio do texto }
+  repeat
+    LAnterior := Result;
+    Result := StringReplace(Result, '  ', ' ', [rfReplaceAll]);
+  until Result = LAnterior;
+end;
+
+class function TTexto.Equivalentes(const A, B: string): Boolean;
+begin
+  Result := Normalizar(A) = Normalizar(B);
+end;
+
+end.

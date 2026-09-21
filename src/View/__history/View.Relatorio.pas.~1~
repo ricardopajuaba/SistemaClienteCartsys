@@ -1,0 +1,550 @@
+unit View.Relatorio;
+
+{ ============================================================================
+  Relatorio de clientes (ReportBuilder).
+
+  Atende o item do teste que pede relatorio com tres modos de filtro: todos os
+  clientes, faixa de codigo, ou cidade/estado.
+
+  COMO OS DADOS CHEGAM NO RELATORIO - TppJITPipeline
+
+  O caminho comum no ReportBuilder e ligar um TppDBPipeline num TDataSet. Isso
+  exigiria trazer um TFDQuery para dentro do formulario - ou seja, SQL na tela
+  outra vez, justamente o que a arquitetura deste projeto evita.
+
+  O ReportBuilder oferece uma saida melhor: o JIT ("just in time") pipeline.
+  Em vez de um dataset, ele trabalha por eventos:
+
+      RecordCount      -> quantos registros existem
+      RecordIndex      -> em qual registro o motor esta agora
+      OnGetFieldValue  -> "me de o campo X do registro atual"
+
+  Com isso o relatorio consome direto a TObjectList<TCliente> devolvida pelo
+  Controller. Nenhuma linha de SQL nesta unit, e o mesmo metodo que alimenta o
+  relatorio (ListarParaRelatorio) e o que os testes automatizados exercitam.
+
+  ATENCAO A ASSINATURA DE OnGetFieldValue
+  Ao contrario da maioria dos eventos da VCL, os eventos do ReportBuilder sao
+  FUNCOES, e nao procedures com parametro "var":
+
+      TppGetFieldValueEvent = function(aFieldName: String): Variant of object;
+
+  Escrever o manipulador como "procedure(aFieldName: String; var aValue: ...)"
+  nao compila, e a mensagem do compilador confunde mais do que ajuda:
+
+      E2010 Incompatible types: 'Variant' and 'procedure, untyped pointer
+            or untyped parameter'
+
+  Ela esta dizendo que o esperado devolve Variant e o que foi oferecido e uma
+  procedure. Note tambem que o evento nao recebe Sender: o registro corrente e
+  lido de FPipeline.RecordIndex.
+
+  POR QUE O LAYOUT E MONTADO EM CODIGO E NAO NO DESIGNER?
+  Porque assim o relatorio e conferido pelo compilador e nasce identico em
+  qualquer maquina, sem depender de um .dfm com dezenas de coordenadas. Como
+  as colunas do relatorio sao as mesmas do grid, monta-las a partir de um
+  vetor (ver COLUNAS, abaixo) deixa a manutencao em um lugar so: mexer na
+  largura ou na ordem e mexer em uma linha.
+  ============================================================================ }
+
+interface
+
+uses
+  System.SysUtils,
+  System.Classes,
+  System.Variants,
+  System.Generics.Collections,
+  Vcl.Forms,
+  Vcl.Controls,
+  Vcl.Graphics,
+  Vcl.Dialogs,
+  Vcl.ExtCtrls,
+  Vcl.StdCtrls,
+  cxGraphics,
+  cxControls,
+  cxLookAndFeels,
+  cxLookAndFeelPainters,
+  cxStyles,
+  cxEdit,
+  cxContainer,
+  cxTextEdit,
+  cxMaskEdit,
+  cxDropDownEdit,
+  cxSpinEdit,
+  cxLabel,
+  cxRadioGroup,
+  cxButtons,
+  ppClass,
+  ppCtrls,
+  ppBands,
+  ppPrnabl,
+  ppVar,
+  ppTypes,
+  ppReport,
+  ppDB,
+  ppDBJIT,
+  Model.Entity.Cliente,
+  Model.Entity.Cidade,
+  Model.Entity.Estado,
+  DAO.Cliente,
+  Controller.Cliente;
+
+type
+  TfrmRelatorio = class(TForm)
+    rgFiltro: TcxRadioGroup;
+    lblIdInicial: TcxLabel;
+    seIdInicial: TcxSpinEdit;
+    lblIdFinal: TcxLabel;
+    seIdFinal: TcxSpinEdit;
+    lblEstado: TcxLabel;
+    cbEstado: TcxComboBox;
+    lblCidade: TcxLabel;
+    cbCidade: TcxComboBox;
+    pnlAcoes: TPanel;
+    btnVisualizar: TcxButton;
+    btnFechar: TcxButton;
+    procedure FormCreate(Sender: TObject);
+    procedure FormDestroy(Sender: TObject);
+    procedure rgFiltroPropertiesChange(Sender: TObject);
+    procedure cbEstadoPropertiesChange(Sender: TObject);
+    procedure btnVisualizarClick(Sender: TObject);
+    procedure btnFecharClick(Sender: TObject);
+  private
+    FController: TClienteController;
+    FEstados: TObjectList<TEstado>;
+    FCidades: TObjectList<TCidade>;
+
+    { Dados do relatorio em producao. Vive so durante a impressao. }
+    FClientes: TObjectList<TCliente>;
+
+    FReport: TppReport;
+    FPipeline: TppJITPipeline;
+
+    procedure CarregarCombos;
+    procedure FiltrarCidadesPorEstado(AEstadoId: Integer);
+    procedure AtualizarHabilitacao;
+
+    function FiltroSelecionado: TFiltroRelatorio;
+    function EstadoSelecionado: Integer;
+    function CidadeSelecionada: Integer;
+
+    procedure MontarRelatorio;
+    function PipelineGetFieldValue(aFieldName: String): Variant;
+  public
+    { Aplica o filtro escolhido na tela, busca os dados e monta o relatorio -
+      SEM abrir o preview. Devolve quantos clientes entraram.
+
+      Separar "montar" de "mostrar" tem duas vantagens praticas: o relatorio
+      fica exercitavel sem abrir janela (ver tests\TesteForms.dpr) e, no dia
+      em que alguem pedir o mesmo relatorio direto em PDF ou na impressora,
+      basta trocar o DeviceType depois de chamar este metodo. }
+    function Gerar: Integer;
+  end;
+
+implementation
+
+uses
+  Service.EnterTab,
+  Service.Documento,
+  Service.ViaCep;
+
+{$R *.dfm}
+
+type
+  { Descricao de uma coluna do relatorio. O mesmo vetor gera o cabecalho e a
+    faixa de detalhe, entao nao ha como um sair do lugar sem o outro. }
+  TColunaRelatorio = record
+    Campo: string;       { nome usado no OnGetFieldValue }
+    Titulo: string;      { texto do cabecalho }
+    EsquerdaMm: Double;
+    LarguraMm: Double;
+  end;
+
+const
+  { Larguras somam 275 mm, que e o util de uma A4 deitada (297 mm) com as
+    margens de 11 mm definidas em MontarRelatorio. }
+  COLUNAS: array[0..9] of TColunaRelatorio = (
+    (Campo: 'ID';          Titulo: 'Cod.';       EsquerdaMm:   0; LarguraMm: 12),
+    (Campo: 'NOME';        Titulo: 'Nome';       EsquerdaMm:  12; LarguraMm: 55),
+    (Campo: 'CPF_CNPJ';    Titulo: 'CPF / CNPJ'; EsquerdaMm:  67; LarguraMm: 32),
+    (Campo: 'CEP';         Titulo: 'CEP';        EsquerdaMm:  99; LarguraMm: 20),
+    (Campo: 'ENDERECO';    Titulo: 'Endereco';   EsquerdaMm: 119; LarguraMm: 50),
+    (Campo: 'NUMERO';      Titulo: 'Num.';       EsquerdaMm: 169; LarguraMm: 12),
+    (Campo: 'BAIRRO';      Titulo: 'Bairro';     EsquerdaMm: 181; LarguraMm: 33),
+    (Campo: 'CIDADE';      Titulo: 'Cidade';     EsquerdaMm: 214; LarguraMm: 33),
+    (Campo: 'UF';          Titulo: 'UF';         EsquerdaMm: 247; LarguraMm:  8),
+    (Campo: 'NASCIMENTO';  Titulo: 'Nascimento'; EsquerdaMm: 255; LarguraMm: 20)
+  );
+
+  MM = 1000; { as coordenadas do ReportBuilder sao em milesimos de milimetro }
+
+{ ---------------------------------------------------------------------------
+  Ciclo de vida
+  --------------------------------------------------------------------------- }
+
+procedure TfrmRelatorio.FormCreate(Sender: TObject);
+begin
+  FController := TClienteController.Create;
+  FClientes := nil;
+
+  CarregarCombos;
+  AtualizarHabilitacao;
+
+  TEnterComoTab.Instalar(Self);
+end;
+
+procedure TfrmRelatorio.FormDestroy(Sender: TObject);
+begin
+  cbCidade.Properties.Items.Clear;
+  cbEstado.Properties.Items.Clear;
+
+  FreeAndNil(FClientes);
+  FreeAndNil(FCidades);
+  FreeAndNil(FEstados);
+  FreeAndNil(FController);
+
+  { O relatorio e o pipeline sao criados com Self como Owner, entao o
+    formulario ja os destruiria. Liberar aqui deixa a ordem explicita: o
+    pipeline referencia FClientes, que acabou de ser liberado acima. }
+  FreeAndNil(FReport);
+  FreeAndNil(FPipeline);
+end;
+
+{ ---------------------------------------------------------------------------
+  Combos e habilitacao
+  --------------------------------------------------------------------------- }
+
+procedure TfrmRelatorio.CarregarCombos;
+var
+  I: Integer;
+begin
+  FEstados := FController.ListarEstados;
+  FCidades := FController.ListarCidades;
+
+  cbEstado.Properties.Items.Clear;
+  cbEstado.Properties.Items.AddObject('(todos os estados)', nil);
+  for I := 0 to FEstados.Count - 1 do
+    cbEstado.Properties.Items.AddObject(FEstados[I].Descricao, FEstados[I]);
+  cbEstado.ItemIndex := 0;
+
+  FiltrarCidadesPorEstado(0);
+end;
+
+procedure TfrmRelatorio.FiltrarCidadesPorEstado(AEstadoId: Integer);
+var
+  I: Integer;
+begin
+  cbCidade.Properties.Items.BeginUpdate;
+  try
+    cbCidade.Properties.Items.Clear;
+    cbCidade.Properties.Items.AddObject('(todas as cidades)', nil);
+
+    for I := 0 to FCidades.Count - 1 do
+      if (AEstadoId = 0) or (FCidades[I].EstadoId = AEstadoId) then
+        cbCidade.Properties.Items.AddObject(FCidades[I].Descricao, FCidades[I]);
+  finally
+    cbCidade.Properties.Items.EndUpdate;
+  end;
+
+  cbCidade.ItemIndex := 0;
+end;
+
+{ Deixa visivel apenas o que o filtro escolhido usa. Campo desabilitado
+  comunica melhor que campo habilitado e ignorado. }
+procedure TfrmRelatorio.AtualizarHabilitacao;
+var
+  LFaixa: Boolean;
+  LLocal: Boolean;
+begin
+  LFaixa := FiltroSelecionado = frFaixaId;
+  LLocal := FiltroSelecionado = frCidadeEstado;
+
+  lblIdInicial.Enabled := LFaixa;
+  seIdInicial.Enabled  := LFaixa;
+  lblIdFinal.Enabled   := LFaixa;
+  seIdFinal.Enabled    := LFaixa;
+
+  lblEstado.Enabled := LLocal;
+  cbEstado.Enabled  := LLocal;
+  lblCidade.Enabled := LLocal;
+  cbCidade.Enabled  := LLocal;
+end;
+
+procedure TfrmRelatorio.rgFiltroPropertiesChange(Sender: TObject);
+begin
+  AtualizarHabilitacao;
+end;
+
+procedure TfrmRelatorio.cbEstadoPropertiesChange(Sender: TObject);
+begin
+  FiltrarCidadesPorEstado(EstadoSelecionado);
+end;
+
+{ A ordem dos itens do radio group acompanha TFiltroRelatorio:
+  frTodos, frFaixaId, frCidadeEstado. }
+function TfrmRelatorio.FiltroSelecionado: TFiltroRelatorio;
+begin
+  if (rgFiltro.ItemIndex < 0) or
+     (rgFiltro.ItemIndex > Ord(High(TFiltroRelatorio))) then
+    Result := frTodos
+  else
+    Result := TFiltroRelatorio(rgFiltro.ItemIndex);
+end;
+
+function TfrmRelatorio.EstadoSelecionado: Integer;
+var
+  LObjeto: TObject;
+begin
+  Result := 0;
+  if cbEstado.ItemIndex < 0 then
+    Exit;
+  LObjeto := cbEstado.Properties.Items.Objects[cbEstado.ItemIndex];
+  if LObjeto is TEstado then
+    Result := TEstado(LObjeto).Id;
+end;
+
+function TfrmRelatorio.CidadeSelecionada: Integer;
+var
+  LObjeto: TObject;
+begin
+  Result := 0;
+  if cbCidade.ItemIndex < 0 then
+    Exit;
+  LObjeto := cbCidade.Properties.Items.Objects[cbCidade.ItemIndex];
+  if LObjeto is TCidade then
+    Result := TCidade(LObjeto).Id;
+end;
+
+{ ---------------------------------------------------------------------------
+  Fornecimento dos dados ao ReportBuilder
+
+  Chamado pelo motor do relatorio uma vez por campo, por registro. O registro
+  atual e FPipeline.RecordIndex.
+  --------------------------------------------------------------------------- }
+
+function TfrmRelatorio.PipelineGetFieldValue(aFieldName: String): Variant;
+var
+  LCliente: TCliente;
+  LIndice: Integer;
+begin
+  { Null em campo desconhecido, fora de faixa, ou sem dados: o ReportBuilder
+    imprime celula em branco, que e o comportamento correto. }
+  Result := Null;
+
+  if not Assigned(FClientes) then
+    Exit;
+
+  LIndice := FPipeline.RecordIndex;
+  if (LIndice < 0) or (LIndice >= FClientes.Count) then
+    Exit;
+
+  LCliente := FClientes[LIndice];
+
+  if aFieldName = 'ID' then
+    Result := LCliente.Id
+  else if aFieldName = 'NOME' then
+    Result := LCliente.Nome
+  else if aFieldName = 'CPF_CNPJ' then
+    Result := TDocumento.Formatar(LCliente.CpfCnpj)
+  else if aFieldName = 'CEP' then
+    Result := TViaCepService.Formatar(LCliente.Cep)
+  else if aFieldName = 'ENDERECO' then
+    Result := LCliente.Endereco
+  else if aFieldName = 'NUMERO' then
+    Result := LCliente.Numero
+  else if aFieldName = 'BAIRRO' then
+    Result := LCliente.Bairro
+  else if aFieldName = 'CIDADE' then
+    Result := LCliente.NomeCidade
+  else if aFieldName = 'UF' then
+    Result := LCliente.Uf
+  else if aFieldName = 'NASCIMENTO' then
+  begin
+    { Data nula na entidade e 0. Deixar Null imprime em branco em vez de
+      30/12/1899. }
+    if LCliente.DataNascimento > 0 then
+      Result := FormatDateTime('dd/mm/yyyy', LCliente.DataNascimento);
+  end;
+end;
+
+{ ---------------------------------------------------------------------------
+  Montagem do relatorio
+  --------------------------------------------------------------------------- }
+
+procedure TfrmRelatorio.MontarRelatorio;
+
+  { As coordenadas mm* (milesimos de milimetro) sao SOMENTE LEITURA nos
+    controles do ReportBuilder. Quem se escreve e Left/Top/Width/Height, que
+    sao Single expressos na unidade do relatorio - definida como milimetros
+    logo abaixo, em FReport.Units. }
+  procedure Posicionar(AComp: TppComponent;
+    AEsqMm, ATopoMm, ALargMm, AAltMm: Single);
+  begin
+    AComp.Left   := AEsqMm;
+    AComp.Top    := ATopoMm;
+    AComp.Width  := ALargMm;
+    AComp.Height := AAltMm;
+  end;
+
+  function NovoRotulo(ABand: TppBand; const ATexto: string;
+    AEsqMm, ATopoMm, ALargMm: Double; ANegrito: Boolean): TppLabel;
+  begin
+    Result := TppLabel.Create(Self);
+    Result.Band := ABand;
+    Result.Caption := ATexto;
+    Result.Font.Name := 'Arial';
+    Result.Font.Size := 8;
+    if ANegrito then
+      Result.Font.Style := [fsBold];
+    Result.Transparent := True;
+    Posicionar(Result, AEsqMm, ATopoMm, ALargMm, 4);
+  end;
+
+var
+  I: Integer;
+  LTexto: TppDBText;
+  LLinha: TppLine;
+  LTitulo: TppLabel;
+  LVariavel: TppSystemVariable;
+begin
+  FreeAndNil(FReport);
+  FreeAndNil(FPipeline);
+
+  { ---------------- pipeline ---------------- }
+  FPipeline := TppJITPipeline.Create(Self);
+  FPipeline.UserName := 'plClientes';
+  FPipeline.OnGetFieldValue := PipelineGetFieldValue;
+
+  for I := Low(COLUNAS) to High(COLUNAS) do
+    FPipeline.DefineField(COLUNAS[I].Campo, dtString, 100);
+
+  { ---------------- relatorio ---------------- }
+  FReport := TppReport.Create(Self);
+  FReport.UserName := 'repClientes';
+  FReport.DataPipeline := FPipeline;
+  FReport.Units := utMillimeters;
+
+  { Deitada: sao dez colunas, e em retrato elas nao cabem sem espremer o nome. }
+  FReport.PrinterSetup.Orientation := poLandscape;
+
+  { Margens em milimetros, pela mesma razao do Posicionar acima. }
+  FReport.PrinterSetup.MarginLeft   := 11;
+  FReport.PrinterSetup.MarginRight  := 11;
+  FReport.PrinterSetup.MarginTop    := 11;
+  FReport.PrinterSetup.MarginBottom := 11;
+
+  FReport.DefaultBands := [btTitle, btHeader, btDetail, btFooter];
+  FReport.CreateDefaultBands;
+
+  { ---------------- titulo ---------------- }
+  FReport.TitleBand.mmHeight := 16 * MM;
+
+  LTitulo := NovoRotulo(FReport.TitleBand, 'Relatorio de Clientes', 0, 1, 120, True);
+  LTitulo.Font.Size := 14;
+  Posicionar(LTitulo, 0, 1, 120, 7);
+
+  NovoRotulo(FReport.TitleBand, 'Emitido em ' +
+    FormatDateTime('dd/mm/yyyy hh:nn', Now), 0, 9, 120, False);
+
+  { ---------------- cabecalho das colunas ---------------- }
+  FReport.HeaderBand.mmHeight := 8 * MM;
+
+  for I := Low(COLUNAS) to High(COLUNAS) do
+    NovoRotulo(FReport.HeaderBand, COLUNAS[I].Titulo,
+      COLUNAS[I].EsquerdaMm, 1, COLUNAS[I].LarguraMm, True);
+
+  LLinha := TppLine.Create(Self);
+  LLinha.Band := FReport.HeaderBand;
+  LLinha.Position := lpBottom;
+  LLinha.Weight := 0.75;
+  Posicionar(LLinha, 0, 6.5, 275, 1);
+
+  { ---------------- detalhe ---------------- }
+  FReport.DetailBand.mmHeight := 5 * MM;
+
+  for I := Low(COLUNAS) to High(COLUNAS) do
+  begin
+    LTexto := TppDBText.Create(Self);
+    LTexto.Band := FReport.DetailBand;
+    LTexto.DataPipeline := FPipeline;
+    LTexto.DataField := COLUNAS[I].Campo;
+    LTexto.Font.Name := 'Arial';
+    LTexto.Font.Size := 8;
+    LTexto.Transparent := True;
+    Posicionar(LTexto, COLUNAS[I].EsquerdaMm, 0.5, COLUNAS[I].LarguraMm, 4);
+  end;
+
+  { ---------------- rodape ---------------- }
+  FReport.FooterBand.mmHeight := 10 * MM;
+
+  LLinha := TppLine.Create(Self);
+  LLinha.Band := FReport.FooterBand;
+  LLinha.Position := lpTop;
+  LLinha.Weight := 0.75;
+  Posicionar(LLinha, 0, 1, 275, 1);
+
+  NovoRotulo(FReport.FooterBand,
+    Format('Total de clientes: %d', [FClientes.Count]), 0, 3, 100, False);
+
+  LVariavel := TppSystemVariable.Create(Self);
+  LVariavel.Band := FReport.FooterBand;
+  LVariavel.VarType := vtPageNoDesc;
+  LVariavel.Font.Name := 'Arial';
+  LVariavel.Font.Size := 8;
+  LVariavel.Alignment := taRightJustify;
+  LVariavel.Transparent := True;
+  Posicionar(LVariavel, 195, 3, 80, 4);
+end;
+
+{ ---------------------------------------------------------------------------
+  Acoes
+  --------------------------------------------------------------------------- }
+
+function TfrmRelatorio.Gerar: Integer;
+begin
+  Screen.Cursor := crHourGlass;
+  try
+    FreeAndNil(FClientes);
+    FClientes := FController.ListarParaRelatorio(
+      FiltroSelecionado,
+      seIdInicial.Value,
+      seIdFinal.Value,
+      CidadeSelecionada,
+      EstadoSelecionado);
+  finally
+    Screen.Cursor := crDefault;
+  end;
+
+  Result := FClientes.Count;
+  if Result = 0 then
+    Exit;
+
+  MontarRelatorio;
+
+  { E daqui que o ReportBuilder descobre quantas vezes chamar o
+    OnGetFieldValue. Sem isso o relatorio sai vazio. }
+  FPipeline.RecordCount := FClientes.Count;
+end;
+
+procedure TfrmRelatorio.btnVisualizarClick(Sender: TObject);
+begin
+  if Gerar = 0 then
+  begin
+    ShowMessage('Nenhum cliente encontrado para o filtro informado.');
+    Exit;
+  end;
+
+  { Preview na tela, sem passar pela caixa de dialogo de impressao. Quem
+    quiser imprimir de verdade usa o botao da propria janela de preview. }
+  FReport.DeviceType := 'Screen';
+  FReport.ShowPrintDialog := False;
+  FReport.ModalPreview := True;
+  FReport.Print;
+end;
+
+procedure TfrmRelatorio.btnFecharClick(Sender: TObject);
+begin
+  Close;
+end;
+
+end.

@@ -1,0 +1,53 @@
+object frmPrincipal: TfrmPrincipal
+  Left = 0
+  Top = 0
+  Caption = 'Controle de Clientes'
+  ClientHeight = 441
+  ClientWidth = 784
+  Color = clBtnFace
+  Font.Charset = DEFAULT_CHARSET
+  Font.Color = clWindowText
+  Font.Height = -12
+  Font.Name = 'Segoe UI'
+  Font.Style = []
+  Menu = mnuPrincipal
+  Position = poScreenCenter
+  OnCreate = FormCreate
+  TextHeight = 15
+  object stbRodape: TStatusBar
+    Left = 0
+    Top = 422
+    Width = 784
+    Height = 19
+    Panels = <>
+    SimplePanel = True
+  end
+  object mnuPrincipal: TMainMenu
+    Left = 40
+    Top = 32
+    object miSistema: TMenuItem
+      Caption = '&Sistema'
+      object miSair: TMenuItem
+        Caption = 'Sai&r'
+        ShortCut = 32883
+        OnClick = miSairClick
+      end
+    end
+    object miCadastros: TMenuItem
+      Caption = '&Cadastros'
+      object miCliente: TMenuItem
+        Caption = '&Cliente'
+        ShortCut = 116
+        OnClick = miClienteClick
+      end
+    end
+    object miRelatorios: TMenuItem
+      Caption = '&Relatorios'
+      object miRelatorioCliente: TMenuItem
+        Caption = 'Relatorio de &Clientes'
+        ShortCut = 121
+        OnClick = miRelatorioClienteClick
+      end
+    end
+  end
+end

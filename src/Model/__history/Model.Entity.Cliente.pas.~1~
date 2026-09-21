@@ -1,0 +1,116 @@
+unit Model.Entity.Cliente;
+
+{ ============================================================================
+  Entidade CLIENTE - o coracao do sistema.
+
+  Observacao sobre o campo CidadeId: no banco a coluna se chama apenas CIDADE
+  (assim a especificacao do teste pediu), mas ela guarda o ID da cidade, nao o
+  nome. Aqui na entidade ela se chama CidadeId justamente para deixar isso
+  explicito e evitar confusao com NomeCidade, que vem do JOIN.
+
+  Regra do teste: os clientes de ID 1, 5, 8, 10 e 15 nao podem ser excluidos.
+  Ela mora em Service.RegrasCliente, e nao aqui, porque e uma regra de negocio
+  do sistema e nao uma caracteristica do cliente em si.
+  ============================================================================ }
+
+interface
+
+type
+  TCliente = class
+  private
+    FId: Integer;
+    FNome: string;
+    FCep: string;
+    FCpfCnpj: string;
+    FEndereco: string;
+    FNumero: string;
+    FComplemento: string;
+    FBairro: string;
+    FCidadeId: Integer;
+    FDataNascimento: TDateTime;
+    FNomeCidade: string;
+    FUf: string;
+    FNomeEstado: string;
+  public
+    constructor Create;
+
+    { Copia os dados de outro cliente. Usado na tela de cadastro para guardar o
+      estado original do registro antes da edicao, e poder cancelar. }
+    procedure Assign(ASource: TCliente);
+
+    property Id: Integer read FId write FId;
+    property Nome: string read FNome write FNome;
+    property Cep: string read FCep write FCep;
+    property CpfCnpj: string read FCpfCnpj write FCpfCnpj;
+    property Endereco: string read FEndereco write FEndereco;
+    property Numero: string read FNumero write FNumero;
+    property Complemento: string read FComplemento write FComplemento;
+    property Bairro: string read FBairro write FBairro;
+    property CidadeId: Integer read FCidadeId write FCidadeId;
+    property DataNascimento: TDateTime read FDataNascimento write FDataNascimento;
+
+    { Campos vindos do JOIN - somente leitura na pratica, nao vao no INSERT }
+    property NomeCidade: string read FNomeCidade write FNomeCidade;
+    property Uf: string read FUf write FUf;
+    property NomeEstado: string read FNomeEstado write FNomeEstado;
+
+    { Um registro ainda nao gravado tem Id = 0 }
+    function EhNovo: Boolean;
+
+    { True quando o documento tem 14 digitos (CNPJ); caso contrario e CPF }
+    function EhPessoaJuridica: Boolean;
+  end;
+
+implementation
+
+uses
+  System.SysUtils;
+
+constructor TCliente.Create;
+begin
+  inherited Create;
+  FId := 0;
+  FCidadeId := 0;
+  FDataNascimento := 0;
+end;
+
+procedure TCliente.Assign(ASource: TCliente);
+begin
+  if ASource = nil then
+    Exit;
+
+  FId             := ASource.Id;
+  FNome           := ASource.Nome;
+  FCep            := ASource.Cep;
+  FCpfCnpj        := ASource.CpfCnpj;
+  FEndereco       := ASource.Endereco;
+  FNumero         := ASource.Numero;
+  FComplemento    := ASource.Complemento;
+  FBairro         := ASource.Bairro;
+  FCidadeId       := ASource.CidadeId;
+  FDataNascimento := ASource.DataNascimento;
+  FNomeCidade     := ASource.NomeCidade;
+  FUf             := ASource.Uf;
+  FNomeEstado     := ASource.NomeEstado;
+end;
+
+function TCliente.EhNovo: Boolean;
+begin
+  Result := FId <= 0;
+end;
+
+function TCliente.EhPessoaJuridica: Boolean;
+var
+  LDigitos: string;
+  I: Integer;
+begin
+  { Conta so os digitos - o campo pode vir mascarado da tela }
+  LDigitos := '';
+  for I := 1 to Length(FCpfCnpj) do
+    if CharInSet(FCpfCnpj[I], ['0'..'9']) then
+      LDigitos := LDigitos + FCpfCnpj[I];
+
+  Result := Length(LDigitos) = 14;
+end;
+
+end.
